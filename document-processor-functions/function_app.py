@@ -404,18 +404,19 @@ def split_document(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
 
-        pdf_source = req_body.get('pdf_path')
+        # Accept both pdf_path and pdf_url like other functions
+        pdf_source = req_body.get('pdf_path') or req_body.get('pdf_url')
         split_info = req_body.get('split_info')
 
         if not pdf_source or not split_info:
             return func.HttpResponse(
                 json.dumps(
-                    {"error": "Missing 'pdf_path' or 'split_info' in request body"}),
+                    {"error": "Missing 'pdf_path' or 'pdf_url' and 'split_info' in request body"}),
                 status_code=400,
                 mimetype="application/json"
             )
 
-        # --- Read PDF bytes from blob or URL ---
+        # --- Read PDF bytes from blob, URL, or local storage ---
         if pdf_source.startswith('http://') or pdf_source.startswith('https://'):
             pdf_bytes = read_pdf_from_url(pdf_source)
         elif pdf_source.startswith('blob://'):
@@ -450,7 +451,17 @@ def split_document(req: func.HttpRequest) -> func.HttpResponse:
                     new_pdf.insert_pdf(src_doc, from_page=pno, to_page=pno)
 
                 # Generate new filename
-                base_name = os.path.basename(pdf_source).replace(".pdf", "")
+                # Extract base name from different source types
+                if pdf_source.startswith('blob://'):
+                    base_name = os.path.basename(
+                        pdf_source.replace('blob://', '')).replace(".pdf", "")
+                elif pdf_source.startswith('http://') or pdf_source.startswith('https://'):
+                    base_name = os.path.basename(
+                        pdf_source.split('?')[0]).replace(".pdf", "")
+                else:
+                    base_name = os.path.basename(
+                        pdf_source).replace(".pdf", "")
+
                 safe_type = doc_type.replace(" ", "_").replace("/", "_")
                 new_filename = f"{base_name}-{safe_type}-{i}.pdf"
 
