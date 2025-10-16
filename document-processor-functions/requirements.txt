@@ -9,3 +9,4 @@ openai
 requests
 python-dotenv
 azure-storage-blob
+PyMuPDF

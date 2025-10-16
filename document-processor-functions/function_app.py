@@ -9,6 +9,7 @@ from openai import AzureOpenAI
 from azure.storage.blob import BlobServiceClient
 import os
 
+
 # ============= CONFIGURATION =============
 FORM_RECOGNIZER_ENDPOINT = os.environ.get("FORM_RECOGNIZER_ENDPOINT", "")
 FORM_RECOGNIZER_KEY = os.environ.get("FORM_RECOGNIZER_KEY", "")
