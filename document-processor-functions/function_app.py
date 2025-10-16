@@ -38,8 +38,28 @@ def read_pdf_from_url(pdf_url):
         raise
 
 
-def read_pdf_from_storage(storage_path):
-    """Read PDF from local storage path"""
+def read_pdf_from_blob_storage(blob_name):
+    """Read PDF from Azure Blob Storage"""
+    try:
+        connection_string = f"DefaultEndpointsProtocol=https;AccountName={STORAGE_ACCOUNT_NAME};AccountKey={STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+
+        blob_service_client = BlobServiceClient.from_connection_string(
+            connection_string)
+        blob_client = blob_service_client.get_blob_client(
+            container=STORAGE_CONTAINER_NAME,
+            blob=blob_name
+        )
+
+        pdf_bytes = blob_client.download_blob().readall()
+        logging.info(f"Successfully read PDF from blob storage: {blob_name}")
+        return pdf_bytes
+    except Exception as e:
+        logging.error(f"Error reading PDF from blob storage: {str(e)}")
+        raise
+
+
+def read_pdf_from_local_storage(storage_path):
+    """Read PDF from local storage path (fallback)"""
     try:
         with open(storage_path, 'rb') as f:
             pdf_bytes = f.read()
@@ -193,11 +213,17 @@ def classify_document(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Read PDF
+        # Read PDF from appropriate source
         if pdf_source.startswith('http://') or pdf_source.startswith('https://'):
+            # URL (direct link)
             pdf_bytes = read_pdf_from_url(pdf_source)
+        elif pdf_source.startswith('blob://'):
+            # Azure Blob Storage reference (e.g., blob://folder/file.pdf)
+            blob_name = pdf_source.replace('blob://', '')
+            pdf_bytes = read_pdf_from_blob_storage(blob_name)
         else:
-            pdf_bytes = read_pdf_from_storage(pdf_source)
+            # Local file path (fallback)
+            pdf_bytes = read_pdf_from_local_storage(pdf_source)
 
         # Extract text
         pages_text = extract_text_with_document_intelligence(pdf_bytes)
@@ -256,11 +282,17 @@ def extract_text(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Read PDF
+        # Read PDF from appropriate source
         if pdf_source.startswith('http://') or pdf_source.startswith('https://'):
+            # URL (direct link)
             pdf_bytes = read_pdf_from_url(pdf_source)
+        elif pdf_source.startswith('blob://'):
+            # Azure Blob Storage reference (e.g., blob://folder/file.pdf)
+            blob_name = pdf_source.replace('blob://', '')
+            pdf_bytes = read_pdf_from_blob_storage(blob_name)
         else:
-            pdf_bytes = read_pdf_from_storage(pdf_source)
+            # Local file path (fallback)
+            pdf_bytes = read_pdf_from_local_storage(pdf_source)
 
         # Extract text
         pages_text = extract_text_with_document_intelligence(pdf_bytes)
