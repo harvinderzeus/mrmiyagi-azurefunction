@@ -5,6 +5,7 @@ import requests
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.core.credentials import AzureKeyCredential
 from openai import AzureOpenAI
+from azure.storage.blob import BlobServiceClient
 import os
 
 # ============= CONFIGURATION =============
@@ -13,6 +14,12 @@ FORM_RECOGNIZER_KEY = os.environ.get("FORM_RECOGNIZER_KEY", "")
 OPENAI_ENDPOINT = os.environ.get("OPENAI_ENDPOINT", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_DEPLOYMENT = os.environ.get("OPENAI_DEPLOYMENT", "gpt-4o")
+
+# Azure Blob Storage Configuration
+STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME", "sadevmrmiyagi")
+STORAGE_ACCOUNT_KEY = os.environ.get("STORAGE_ACCOUNT_KEY", "")
+STORAGE_CONTAINER_NAME = os.environ.get(
+    "STORAGE_CONTAINER_NAME", "dev-mr-miyagi")
 
 app = func.FunctionApp()
 
