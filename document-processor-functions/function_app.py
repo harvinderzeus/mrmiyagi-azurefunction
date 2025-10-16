@@ -1,3 +1,4 @@
+import fitz  # PyMuPDF
 import azure.functions as func
 import json
 import logging
@@ -386,6 +387,101 @@ def batch_process(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         logging.error(f"Error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Processing error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.route(route="split", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def split_document(req: func.HttpRequest) -> func.HttpResponse:
+    """Split a PDF into multiple smaller PDFs based on page ranges and document types"""
+
+    logging.info("SplitDocument HTTP trigger called")
+
+    try:
+        req_body = req.get_json()
+
+        pdf_source = req_body.get('pdf_path')
+        split_info = req_body.get('split_info')
+
+        if not pdf_source or not split_info:
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": "Missing 'pdf_path' or 'split_info' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # --- Read PDF bytes from blob or URL ---
+        if pdf_source.startswith('http://') or pdf_source.startswith('https://'):
+            pdf_bytes = read_pdf_from_url(pdf_source)
+        elif pdf_source.startswith('blob://'):
+            blob_name = pdf_source.replace('blob://', '')
+            pdf_bytes = read_pdf_from_blob_storage(blob_name)
+        else:
+            pdf_bytes = read_pdf_from_local_storage(pdf_source)
+
+        # --- Load original PDF ---
+        src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        connection_string = f"DefaultEndpointsProtocol=https;AccountName={STORAGE_ACCOUNT_NAME};AccountKey={STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+        blob_service_client = BlobServiceClient.from_connection_string(
+            connection_string)
+        container_client = blob_service_client.get_container_client(
+            STORAGE_CONTAINER_NAME)
+
+        new_files = []
+
+        # --- For each document type ---
+        for doc_type, sections in split_info.items():
+            for i, section in enumerate(sections, start=1):
+                start_page = section.get("start_page")
+                end_page = section.get("end_page")
+
+                if start_page is None or end_page is None:
+                    continue
+
+                # Create new PDF
+                new_pdf = fitz.open()
+                for pno in range(start_page - 1, end_page):  # PyMuPDF is 0-indexed
+                    new_pdf.insert_pdf(src_doc, from_page=pno, to_page=pno)
+
+                # Generate new filename
+                base_name = os.path.basename(pdf_source).replace(".pdf", "")
+                safe_type = doc_type.replace(" ", "_").replace("/", "_")
+                new_filename = f"{base_name}-{safe_type}-{i}.pdf"
+
+                # Save to memory
+                pdf_bytes_out = new_pdf.tobytes()
+                blob_client = container_client.get_blob_client(new_filename)
+                blob_client.upload_blob(pdf_bytes_out, overwrite=True)
+
+                blob_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_NAME}/{new_filename}"
+                new_files.append({
+                    "document_type": doc_type,
+                    "pages": f"{start_page}-{end_page}",
+                    "blob_name": new_filename,
+                    "blob_url": blob_url
+                })
+
+                new_pdf.close()
+
+        src_doc.close()
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "message": f"Split into {len(new_files)} files successfully.",
+                "files": new_files
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error in split_document: {str(e)}")
         return func.HttpResponse(
             json.dumps({"error": f"Processing error: {str(e)}"}),
             status_code=500,
