@@ -132,8 +132,127 @@ def save_extracted_json(file_path: str, extraction_data: Dict) -> str:
         raise
 
 
+
+
+def format_classification_results(classification_result: Dict) -> Dict:
+    """Format classification results"""
+    formatted = {}
+
+    if "documents" in classification_result:
+        for doc in classification_result["documents"]:
+            doc_type = doc.get("document_type", "Other")
+
+            if doc_type not in formatted:
+                formatted[doc_type] = []
+
+            formatted[doc_type].append({
+                "start_page": doc.get("start_page"),
+                "end_page": doc.get("end_page"),
+                "confidence": doc.get("confidence", "unknown"),
+                "description": doc.get("description", "")
+            })
+
+    return formatted
+
+
+def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple) -> List[Dict]:
+    """
+    Use AI to identify headings and subheadings for pages in a document section
+    """
+    start_page, end_page = page_range
+
+    system_prompt = """You are a precise document-structure analyst.
+ONLY return a single JSON object with this exact schema:
+{
+  "page": <int>,
+  "headings": ["<string>", "..."],
+  "subheadings": ["<string>", "..."]
+}
+Guidance:
+- Consider that true headings are top-level section titles on THIS page (e.g., document title, ARTICLE/SECTION headers, bold/all-caps prominent lines, or numbered section starts like '1.' / 'Section 1').
+- Consider subheadings as secondary titles under those headings on THIS page (e.g., 1.1, Exhibit labels, clause titles under a section).
+- Ignore body paragraphs, boilerplate, and long sentences.
+- Do not infer content from other pages.
+- If none found, return empty arrays.
+Return VALID JSON ONLY."""
+
+    results = []
+    
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        # Process each page individually
+        for page_num in range(start_page, end_page + 1):
+            if page_num not in pages_data:
+                results.append({
+                    "page_number": page_num,
+                    "heading": document_type,
+                    "subheading": None
+                })
+                continue
+
+            page_text = pages_data[page_num]["full_text"]
+            
+            user_prompt = f"""PAGE {page_num} TEXT (verbatim from OCR):
+{page_text}
+
+Extract headings and subheadings for THIS page only."""
+
+            try:
+                response = client.chat.completions.create(
+                    model=OPENAI_DEPLOYMENT,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.2,
+                    response_format={"type": "json_object"}
+                )
+
+                result_text = response.choices[0].message.content
+                result_json = json.loads(result_text)
+
+                # Convert the response format to match your existing structure
+                headings = result_json.get("headings", [])
+                subheadings = result_json.get("subheadings", [])
+                
+                results.append({
+                    "page_number": page_num,
+                    "heading": headings[0] if headings else document_type,
+                    "subheading": subheadings[0] if subheadings else None,
+                    "all_headings": headings,  # Preserve all found headings
+                    "all_subheadings": subheadings  # Preserve all found subheadings
+                })
+
+            except Exception as e:
+                logging.error(f"Error processing page {page_num}: {str(e)}")
+                results.append({
+                    "page_number": page_num,
+                    "heading": document_type,
+                    "subheading": None
+                })
+
+        return results
+
+    except Exception as e:
+        logging.error(f"Error identifying headings: {str(e)}")
+        # Fallback: use document type as heading
+        return [
+            {
+                "page_number": page_num,
+                "heading": document_type,
+                "subheading": None
+            }
+            for page_num in range(start_page, end_page + 1)
+        ]
+
+
 def classify_documents_with_ai(pages_data: Dict[int, Any], document_types: List[str] = None) -> Dict:
-    """Use OpenAI to classify document types"""
+    """Use OpenAI to classify document types with enhanced error handling"""
 
     base_prompt = """You are a document classification expert. Analyze the following multi-page document and identify different document types within it.
 
@@ -180,6 +299,7 @@ Here are the pages to analyze:
             api_version="2025-01-01-preview"
         )
 
+        logging.info("Sending classification request to OpenAI")
         response = client.chat.completions.create(
             model=OPENAI_DEPLOYMENT,
             messages=[
@@ -191,104 +311,35 @@ Here are the pages to analyze:
         )
 
         result_text = response.choices[0].message.content
-        result_json = json.loads(result_text)
+        logging.info(f"Received OpenAI response: {result_text[:200]}...")
+
+        try:
+            result_json = json.loads(result_text)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse OpenAI response as JSON: {str(e)}")
+            logging.error(f"Response text: {result_text}")
+            # Return a default structure
+            return {
+                "documents": [{
+                    "document_type": "Other",
+                    "start_page": 1,
+                    "end_page": len(pages_data),
+                    "confidence": "low",
+                    "description": "Classification failed, defaulting to single document"
+                }]
+            }
+
+        # Validate structure
+        if "documents" not in result_json:
+            logging.warning("OpenAI response missing 'documents' key")
+            result_json = {"documents": []}
 
         logging.info("Classification completed successfully")
         return result_json
 
     except Exception as e:
-        logging.error(f"Error in AI classification: {str(e)}")
+        logging.error(f"Error in AI classification: {str(e)}", exc_info=True)
         raise
-
-
-def format_classification_results(classification_result: Dict) -> Dict:
-    """Format classification results"""
-    formatted = {}
-
-    if "documents" in classification_result:
-        for doc in classification_result["documents"]:
-            doc_type = doc.get("document_type", "Other")
-
-            if doc_type not in formatted:
-                formatted[doc_type] = []
-
-            formatted[doc_type].append({
-                "start_page": doc.get("start_page"),
-                "end_page": doc.get("end_page"),
-                "confidence": doc.get("confidence", "unknown"),
-                "description": doc.get("description", "")
-            })
-
-    return formatted
-
-
-def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple) -> List[Dict]:
-    """
-    Use AI to identify headings and subheadings for pages in a document section
-    """
-    start_page, end_page = page_range
-
-    prompt = f"""You are a document structure expert. Analyze the following pages from a {document_type} document and identify the heading and subheading for each page.
-
-Rules:
-1. Identify the main heading (topic/section) for each page
-2. Identify subheadings (subsections) if present
-3. If no explicit heading is found, use the document type as the heading
-4. Consider font size, formatting, and position to identify headings
-5. Be consistent with heading identification across pages
-
-Return a JSON object with this structure:
-{{
-    "page_structures": [
-        {{
-            "page_number": 1,
-            "heading": "Main Topic",
-            "subheading": "Subsection Name or null if none"
-        }}
-    ]
-}}
-
-Pages to analyze:
-"""
-
-    for page_num in range(start_page, end_page + 1):
-        if page_num in pages_data:
-            text = pages_data[page_num]["full_text"]
-            prompt += f"\n--- PAGE {page_num} ---\n{text[:1500]}\n"
-
-    try:
-        client = AzureOpenAI(
-            azure_endpoint=OPENAI_ENDPOINT,
-            api_key=OPENAI_API_KEY,
-            api_version="2025-01-01-preview"
-        )
-
-        response = client.chat.completions.create(
-            model=OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": "You are a document structure analysis expert. Always respond with valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"}
-        )
-
-        result_text = response.choices[0].message.content
-        result_json = json.loads(result_text)
-
-        return result_json.get("page_structures", [])
-
-    except Exception as e:
-        logging.error(f"Error identifying headings: {str(e)}")
-        # Fallback: use document type as heading
-        return [
-            {
-                "page_number": page_num,
-                "heading": document_type,
-                "subheading": None
-            }
-            for page_num in range(start_page, end_page + 1)
-        ]
 
 
 # ============= HTTP TRIGGER FUNCTIONS =============
@@ -303,7 +354,37 @@ def classify_document(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("API 1: Classify - HTTP trigger called")
 
     try:
-        req_body = req.get_json()
+        # Validate environment variables first
+        required_vars = {
+            "FORM_RECOGNIZER_ENDPOINT": FORM_RECOGNIZER_ENDPOINT,
+            "FORM_RECOGNIZER_KEY": FORM_RECOGNIZER_KEY,
+            "OPENAI_ENDPOINT": OPENAI_ENDPOINT,
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+            "STORAGE_ACCOUNT_KEY": STORAGE_ACCOUNT_KEY
+        }
+
+        missing_vars = [name for name,
+                        value in required_vars.items() if not value]
+        if missing_vars:
+            error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+            logging.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": error_msg}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Parse request body with error handling
+        try:
+            req_body = req.get_json()
+        except ValueError as e:
+            logging.error(f"Invalid JSON in request: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
         file_path = req_body.get('file_path')
         document_types = req_body.get('document_types')
 
@@ -314,50 +395,87 @@ def classify_document(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
+        logging.info(f"Processing file: {file_path}")
+
         # Read PDF from blob storage
-        pdf_bytes = read_pdf_from_blob(file_path)
+        try:
+            pdf_bytes = read_pdf_from_blob(file_path)
+            logging.info(
+                f"PDF read successfully, size: {len(pdf_bytes)} bytes")
+        except Exception as e:
+            logging.error(f"Failed to read PDF from blob: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to read PDF: {str(e)}"}),
+                status_code=404,
+                mimetype="application/json"
+            )
 
         # Extract text with Document Intelligence
-        pages_data = extract_text_with_document_intelligence(pdf_bytes)
+        try:
+            pages_data = extract_text_with_document_intelligence(pdf_bytes)
+            logging.info(f"Extracted {len(pages_data)} pages")
+        except Exception as e:
+            logging.error(f"Document Intelligence failed: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Text extraction failed: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
 
         # Save extracted JSON
-        extracted_json_path = save_extracted_json(file_path, pages_data)
+        try:
+            extracted_json_path = save_extracted_json(file_path, pages_data)
+            logging.info(f"Saved extraction to: {extracted_json_path}")
+        except Exception as e:
+            logging.error(f"Failed to save extracted JSON: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to save extraction: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
 
         # Classify documents
-        classification_result = classify_documents_with_ai(
-            pages_data, document_types)
+        try:
+            classification_result = classify_documents_with_ai(
+                pages_data, document_types)
+            logging.info("Classification completed")
+        except Exception as e:
+            logging.error(f"Classification failed: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Classification failed: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
 
         # Format results
         formatted_results = format_classification_results(
             classification_result)
 
+        response_data = {
+            "status": "success",
+            "file_path": file_path,
+            "total_pages": len(pages_data),
+            "classification": formatted_results,
+            "extracted_json_path": extracted_json_path
+        }
+
+        logging.info("Classification successful")
         return func.HttpResponse(
-            json.dumps({
-                "status": "success",
-                "file_path": file_path,
-                "total_pages": len(pages_data),
-                "classification": formatted_results,
-                "extracted_json_path": extracted_json_path
-            }, indent=2),
+            json.dumps(response_data, indent=2),
             status_code=200,
             mimetype="application/json"
         )
 
-    except ValueError as e:
-        logging.error(f"Invalid JSON: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": "Invalid JSON in request body"}),
-            status_code=400,
-            mimetype="application/json"
-        )
-
     except Exception as e:
-        logging.error(f"Error: {str(e)}")
+        # Catch-all for unexpected errors
+        logging.error(
+            f"Unexpected error in classify_document: {str(e)}", exc_info=True)
         return func.HttpResponse(
-            json.dumps({"error": f"Processing error: {str(e)}"}),
+            json.dumps({"error": f"Internal server error: {str(e)}"}),
             status_code=500,
             mimetype="application/json"
         )
+
 
 
 @app.route(route="split", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
