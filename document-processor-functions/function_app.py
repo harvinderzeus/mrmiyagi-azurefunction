@@ -132,8 +132,6 @@ def save_extracted_json(file_path: str, extraction_data: Dict) -> str:
         raise
 
 
-
-
 def format_classification_results(classification_result: Dict) -> Dict:
     """Format classification results"""
     formatted = {}
@@ -155,9 +153,96 @@ def format_classification_results(classification_result: Dict) -> Dict:
     return formatted
 
 
-def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple) -> List[Dict]:
+def extract_items_from_pages(pages_data: Dict[int, Any], page_range: tuple, items_to_extract: Dict[str, str]) -> Dict:
+    """
+    Extract specific items from pages using AI
+    
+    Args:
+        pages_data: Dictionary of page data
+        page_range: Tuple of (start_page, end_page)
+        items_to_extract: Dictionary like {'broker name': 'single', 'customer': 'single', 'price': 'list'}
+    
+    Returns:
+        Dictionary with extracted items consolidated across pages
+    """
+    start_page, end_page = page_range
+
+    if not items_to_extract:
+        return {}
+
+    # Build the system prompt
+    system_prompt = """You are a precise data extraction specialist.
+Extract the requested items from the document pages.
+
+IMPORTANT RULES:
+- For 'single' type items: Extract only ONE value (the most prominent/relevant one across all pages)
+- For 'list' type items: Extract ALL occurrences found across all pages as an array
+- Return null for items not found
+- Extract exact values as they appear in the document
+- Do not invent or infer values
+
+ONLY return a valid JSON object with this structure:
+{
+  "extracted_items": {
+    "item_name": "value for single items" OR ["value1", "value2"] for list items,
+    ...
+  }
+}"""
+
+    # Build items description for the prompt
+    items_desc = "\n".join(
+        [f"- '{item}' (type: {item_type})" for item, item_type in items_to_extract.items()])
+
+    # Collect text from all pages in range
+    pages_text = ""
+    for page_num in range(start_page, end_page + 1):
+        if page_num in pages_data:
+            pages_text += f"\n--- PAGE {page_num} ---\n{pages_data[page_num]['full_text']}\n"
+
+    user_prompt = f"""Extract the following items from the document pages:
+
+{items_desc}
+
+Document text:
+{pages_text}
+
+Return the extracted items in JSON format."""
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.choices[0].message.content
+        result_json = json.loads(result_text)
+
+        extracted_items = result_json.get("extracted_items", {})
+        logging.info(f"Successfully extracted {len(extracted_items)} items")
+
+        return extracted_items
+
+    except Exception as e:
+        logging.error(f"Error extracting items: {str(e)}")
+        # Return empty dict with null values for all requested items
+        return {item: None for item in items_to_extract.keys()}
+
+
+def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple, items_to_extract: Dict[str, str] = None) -> List[Dict]:
     """
     Use AI to identify headings and subheadings for pages in a document section
+    Optionally extract specific items and consolidate them
     """
     start_page, end_page = page_range
 
@@ -177,7 +262,7 @@ Guidance:
 Return VALID JSON ONLY."""
 
     results = []
-    
+
     try:
         client = AzureOpenAI(
             azure_endpoint=OPENAI_ENDPOINT,
@@ -196,7 +281,7 @@ Return VALID JSON ONLY."""
                 continue
 
             page_text = pages_data[page_num]["full_text"]
-            
+
             user_prompt = f"""PAGE {page_num} TEXT (verbatim from OCR):
 {page_text}
 
@@ -219,7 +304,7 @@ Extract headings and subheadings for THIS page only."""
                 # Convert the response format to match your existing structure
                 headings = result_json.get("headings", [])
                 subheadings = result_json.get("subheadings", [])
-                
+
                 results.append({
                     "page_number": page_num,
                     "heading": headings[0] if headings else document_type,
@@ -235,6 +320,17 @@ Extract headings and subheadings for THIS page only."""
                     "heading": document_type,
                     "subheading": None
                 })
+
+        # If items_to_extract is provided, extract them once for the entire section
+        if items_to_extract:
+            extracted_items = extract_items_from_pages(
+                pages_data, page_range, items_to_extract)
+
+            # Add consolidated extracted items to the first page result
+            if results:
+                results[0]["extracted_items"] = extracted_items
+                logging.info(
+                    f"Added consolidated extracted items to page {results[0]['page_number']}")
 
         return results
 
@@ -477,7 +573,6 @@ def classify_document(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-
 @app.route(route="split", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
 def split_document(req: func.HttpRequest) -> func.HttpResponse:
     """
@@ -583,8 +678,8 @@ def split_document(req: func.HttpRequest) -> func.HttpResponse:
 def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
     """
     API 3 - Structure (Headings & Subheadings)
-    Input: Classification response + Split response + Extracted JSON path
-    Output: Structured response with document type, headings, subheadings, page numbers
+    Input: Classification response + Split response + Extracted JSON path + items_to_extract (optional)
+    Output: Structured response with document type, headings, subheadings, page numbers, and extracted items
     """
     logging.info("API 3: Structure - HTTP trigger called")
 
@@ -593,6 +688,8 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
         classification = req_body.get('classification')
         split_response = req_body.get('split_response')
         extracted_json_path = req_body.get('extracted_json_path')
+        items_to_extract = req_body.get(
+            'items_to_extract')  # NEW: Optional dictionary
 
         if not classification or not extracted_json_path:
             return func.HttpResponse(
@@ -628,22 +725,30 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
                     continue
 
                 # Identify headings and subheadings for this section
+                # Pass items_to_extract if provided
                 page_structures = identify_headings_and_subheadings(
                     pages_data,
                     doc_type,
-                    (start_page, end_page)
+                    (start_page, end_page),
+                    items_to_extract  # NEW: Pass items to extract
                 )
 
                 # Build structured output
                 for page_struct in page_structures:
-                    structured_results.append({
+                    result_entry = {
                         "document_type": doc_type,
                         "page_number": page_struct.get("page_number"),
                         "heading": page_struct.get("heading", doc_type),
                         "subheading": page_struct.get("subheading"),
                         "confidence": section.get("confidence"),
                         "description": section.get("description")
-                    })
+                    }
+
+                    # Add extracted items if present (only on first page of section)
+                    if "extracted_items" in page_struct:
+                        result_entry["extracted_items"] = page_struct["extracted_items"]
+
+                    structured_results.append(result_entry)
 
         return func.HttpResponse(
             json.dumps({
@@ -662,4 +767,3 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-
