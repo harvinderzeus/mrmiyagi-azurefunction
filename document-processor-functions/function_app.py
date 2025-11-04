@@ -153,21 +153,26 @@ def format_classification_results(classification_result: Dict) -> Dict:
     return formatted
 
 
-def extract_items_from_pages(pages_data: Dict[int, Any], page_range: tuple, items_to_extract: Dict[str, str]) -> Dict:
+def extract_items_from_pages(pages_data: Dict[int, Any], page_range: tuple, items_config: List[Dict]) -> Dict:
     """
     Extract specific items from pages using AI
     
     Args:
         pages_data: Dictionary of page data
         page_range: Tuple of (start_page, end_page)
-        items_to_extract: Dictionary like {'broker name': 'single', 'customer': 'single', 'price': 'list'}
+        items_config: List of dictionaries with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
     
     Returns:
-        Dictionary with extracted items consolidated across pages
+        Dictionary with extracted items using variable_name as keys
     """
     start_page, end_page = page_range
 
-    if not items_to_extract:
+    if not items_config:
         return {}
 
     # Build the system prompt
@@ -184,14 +189,16 @@ IMPORTANT RULES:
 ONLY return a valid JSON object with this structure:
 {
   "extracted_items": {
-    "item_name": "value for single items" OR ["value1", "value2"] for list items,
+    "variable_name": "value for single items" OR ["value1", "value2"] for list items,
     ...
   }
 }"""
 
     # Build items description for the prompt
-    items_desc = "\n".join(
-        [f"- '{item}' (type: {item_type})" for item, item_type in items_to_extract.items()])
+    items_desc = "\n".join([
+        f"- Search for '{item['search_key']}' and store as '{item['variable_name']}' (type: {item['type']})"
+        for item in items_config
+    ])
 
     # Collect text from all pages in range
     pages_text = ""
@@ -206,7 +213,7 @@ ONLY return a valid JSON object with this structure:
 Document text:
 {pages_text}
 
-Return the extracted items in JSON format."""
+Return the extracted items in JSON format using the variable names as keys."""
 
     try:
         client = AzureOpenAI(
@@ -236,13 +243,13 @@ Return the extracted items in JSON format."""
     except Exception as e:
         logging.error(f"Error extracting items: {str(e)}")
         # Return empty dict with null values for all requested items
-        return {item: None for item in items_to_extract.keys()}
+        return {item['variable_name']: None for item in items_config}
 
 
-def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple, items_to_extract: Dict[str, str] = None) -> List[Dict]:
+def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple, items_config: List[Dict] = None) -> List[Dict]:
     """
     Use AI to identify headings and subheadings for pages in a document section
-    Optionally extract specific items and consolidate them
+    Optionally extract specific items and add as metadata to each chunk
     """
     start_page, end_page = page_range
 
@@ -263,6 +270,15 @@ Return VALID JSON ONLY."""
 
     results = []
 
+    # Extract items once for the entire section if items_config is provided
+    metadata = {}
+    if items_config:
+        extracted_items = extract_items_from_pages(
+            pages_data, page_range, items_config)
+        metadata = extracted_items
+        logging.info(
+            f"Extracted metadata for section: {list(metadata.keys())}")
+
     try:
         client = AzureOpenAI(
             azure_endpoint=OPENAI_ENDPOINT,
@@ -276,7 +292,8 @@ Return VALID JSON ONLY."""
                 results.append({
                     "page_number": page_num,
                     "heading": document_type,
-                    "subheading": None
+                    "subheading": None,
+                    "metadata": metadata  # Add metadata to every chunk
                 })
                 continue
 
@@ -309,8 +326,9 @@ Extract headings and subheadings for THIS page only."""
                     "page_number": page_num,
                     "heading": headings[0] if headings else document_type,
                     "subheading": subheadings[0] if subheadings else None,
-                    "all_headings": headings,  # Preserve all found headings
-                    "all_subheadings": subheadings  # Preserve all found subheadings
+                    "all_headings": headings,
+                    "all_subheadings": subheadings,
+                    "metadata": metadata  # Add metadata to every chunk
                 })
 
             except Exception as e:
@@ -318,19 +336,9 @@ Extract headings and subheadings for THIS page only."""
                 results.append({
                     "page_number": page_num,
                     "heading": document_type,
-                    "subheading": None
+                    "subheading": None,
+                    "metadata": metadata  # Add metadata even on error
                 })
-
-        # If items_to_extract is provided, extract them once for the entire section
-        if items_to_extract:
-            extracted_items = extract_items_from_pages(
-                pages_data, page_range, items_to_extract)
-
-            # Add consolidated extracted items to the first page result
-            if results:
-                results[0]["extracted_items"] = extracted_items
-                logging.info(
-                    f"Added consolidated extracted items to page {results[0]['page_number']}")
 
         return results
 
@@ -341,7 +349,8 @@ Extract headings and subheadings for THIS page only."""
             {
                 "page_number": page_num,
                 "heading": document_type,
-                "subheading": None
+                "subheading": None,
+                "metadata": metadata
             }
             for page_num in range(start_page, end_page + 1)
         ]
@@ -677,19 +686,26 @@ def split_document(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="structure", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
 def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
     """
-    API 3 - Structure (Headings & Subheadings)
-    Input: Classification response + Split response + Extracted JSON path + items_to_extract (optional)
-    Output: Structured response with document type, headings, subheadings, page numbers, and extracted items
+    API 3 - Structure (Headings & Subheadings with Metadata)
+    Input: 
+        - classification: Classification response
+        - extracted_json_path: Path to extracted JSON
+        - items_to_extract: List of dicts with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
+    Output: Structured response with document type, headings, subheadings, page numbers, and metadata per chunk
     """
     logging.info("API 3: Structure - HTTP trigger called")
 
     try:
         req_body = req.get_json()
         classification = req_body.get('classification')
-        split_response = req_body.get('split_response')
         extracted_json_path = req_body.get('extracted_json_path')
         items_to_extract = req_body.get(
-            'items_to_extract')  # NEW: Optional dictionary
+            'items_to_extract')  # New format: list of dicts
 
         if not classification or not extracted_json_path:
             return func.HttpResponse(
@@ -724,13 +740,12 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
                 if start_page is None or end_page is None:
                     continue
 
-                # Identify headings and subheadings for this section
-                # Pass items_to_extract if provided
+                # Identify headings and subheadings with metadata for this section
                 page_structures = identify_headings_and_subheadings(
                     pages_data,
                     doc_type,
                     (start_page, end_page),
-                    items_to_extract  # NEW: Pass items to extract
+                    items_to_extract
                 )
 
                 # Build structured output
@@ -740,13 +755,11 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
                         "page_number": page_struct.get("page_number"),
                         "heading": page_struct.get("heading", doc_type),
                         "subheading": page_struct.get("subheading"),
+                        # Metadata for chunk
+                        "metadata": page_struct.get("metadata", {}),
                         "confidence": section.get("confidence"),
                         "description": section.get("description")
                     }
-
-                    # Add extracted items if present (only on first page of section)
-                    if "extracted_items" in page_struct:
-                        result_entry["extracted_items"] = page_struct["extracted_items"]
 
                     structured_results.append(result_entry)
 
