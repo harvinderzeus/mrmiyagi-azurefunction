@@ -253,19 +253,42 @@ def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type:
     """
     start_page, end_page = page_range
 
-    system_prompt = """You are a precise document-structure analyst.
+    system_prompt = """You are a comprehensive document-structure analyst. Your task is to capture ALL organizational elements on the page.
+
 ONLY return a single JSON object with this exact schema:
 {
   "page": <int>,
   "headings": ["<string>", "..."],
   "subheadings": ["<string>", "..."]
 }
-Guidance:
-- Consider that true headings are top-level section titles on THIS page (e.g., document title, ARTICLE/SECTION headers, bold/all-caps prominent lines, or numbered section starts like '1.' / 'Section 1').
-- Consider subheadings as secondary titles under those headings on THIS page (e.g., 1.1, Exhibit labels, clause titles under a section).
-- Ignore body paragraphs, boilerplate, and long sentences.
-- Do not infer content from other pages.
+
+CRITICAL INSTRUCTIONS - DO NOT MISS ANYTHING:
+- HEADINGS: Include ALL of the following from THIS page:
+  * Document titles and main section headers
+  * Bold or all-caps prominent text
+  * Numbered sections (e.g., "1.", "Section 1", "ARTICLE I")
+  * Form field labels that organize information (e.g., "Customer", "Broker Details", "Policy Information")
+  * Category headers or group labels
+  * Table headers that organize content
+  * Any text that serves to organize or categorize other content
+  
+- SUBHEADINGS: Include ALL secondary organizational elements:
+  * Subsection numbers (e.g., "1.1", "1.2")
+  * Exhibit labels or references
+  * Clause titles under main sections
+  * Sub-labels under main form sections
+  * Any text that provides a second level of organization
+
+- WHAT TO EXCLUDE (body content):
+  * Complete sentences or paragraphs of body text
+  * Long descriptive text (more than ~10-12 words typically indicates body content)
+  * Filled-in form values or data entries
+  * Footers, page numbers, boilerplate disclaimers
+  
+- IMPORTANT: Be INCLUSIVE rather than exclusive. If unsure whether something is organizational text or body content, include it.
+- Preserve the EXACT wording as it appears in the document.
 - If none found, return empty arrays.
+
 Return VALID JSON ONLY."""
 
     results = []
@@ -302,7 +325,7 @@ Return VALID JSON ONLY."""
             user_prompt = f"""PAGE {page_num} TEXT (verbatim from OCR):
 {page_text}
 
-Extract headings and subheadings for THIS page only."""
+Extract ALL headings and subheadings for THIS page. Be comprehensive - capture all organizational text, labels, and section markers. Do not miss form labels, category headers, or any text that structures the content."""
 
             try:
                 response = client.chat.completions.create(
@@ -311,7 +334,7 @@ Extract headings and subheadings for THIS page only."""
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    temperature=0.2,
+                    temperature=0.1,  # Reduced from 0.2 for more consistent extraction
                     response_format={"type": "json_object"}
                 )
 
@@ -354,7 +377,6 @@ Extract headings and subheadings for THIS page only."""
             }
             for page_num in range(start_page, end_page + 1)
         ]
-
 
 def classify_documents_with_ai(pages_data: Dict[int, Any], document_types: List[str] = None) -> Dict:
     """Use OpenAI to classify document types with enhanced error handling"""
