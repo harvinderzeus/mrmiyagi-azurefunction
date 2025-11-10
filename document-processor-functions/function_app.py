@@ -253,7 +253,7 @@ def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type:
     """
     start_page, end_page = page_range
 
-    system_prompt = """You are a comprehensive document-structure analyst. Your task is to capture ALL organizational elements on the page.
+    system_prompt = """You are a precise document-structure analyst. Extract ALL structural elements that organize content.
 
 ONLY return a single JSON object with this exact schema:
 {
@@ -262,32 +262,34 @@ ONLY return a single JSON object with this exact schema:
   "subheadings": ["<string>", "..."]
 }
 
-CRITICAL INSTRUCTIONS - DO NOT MISS ANYTHING:
-- HEADINGS: Include ALL of the following from THIS page:
-  * Document titles and main section headers
-  * Bold or all-caps prominent text
-  * Numbered sections (e.g., "1.", "Section 1", "ARTICLE I")
-  * Form field labels that organize information (e.g., "Customer", "Broker Details", "Policy Information")
-  * Category headers or group labels
-  * Table headers that organize content
-  * Any text that serves to organize or categorize other content
-  
-- SUBHEADINGS: Include ALL secondary organizational elements:
-  * Subsection numbers (e.g., "1.1", "1.2")
-  * Exhibit labels or references
-  * Clause titles under main sections
-  * Sub-labels under main form sections
-  * Any text that provides a second level of organization
+DEFINITION OF HEADINGS (Primary organizational markers):
+- Document titles, section titles (e.g., "TERMS AND CONDITIONS", "ARTICLE I")
+- Major section headers with numbers (e.g., "1. Definitions", "Section 2")
+- Bold/all-caps standalone labels that organize major sections
+- Top-level form section labels (e.g., "Customer Information", "Broker Details", "Coverage Summary")
+- Main category headers that group related content
 
-- WHAT TO EXCLUDE (body content):
-  * Complete sentences or paragraphs of body text
-  * Long descriptive text (more than ~10-12 words typically indicates body content)
-  * Filled-in form values or data entries
-  * Footers, page numbers, boilerplate disclaimers
-  
-- IMPORTANT: Be INCLUSIVE rather than exclusive. If unsure whether something is organizational text or body content, include it.
-- Preserve the EXACT wording as it appears in the document.
-- If none found, return empty arrays.
+DEFINITION OF SUBHEADINGS (Secondary organizational markers):
+- Subsection numbers under headings (e.g., "1.1 Interpretation", "2.a")
+- Clause titles or labels under main sections
+- Nested form labels (e.g., under "Customer Information": "Primary Contact", "Billing Address")
+- Exhibit or schedule references (e.g., "Exhibit A", "Schedule 1")
+- Table column headers or row labels
+
+EXCLUSION RULES - DO NOT INCLUDE:
+- Full sentences or narrative paragraphs (5+ words forming a complete thought)
+- Data values or filled-in information (names, dates, amounts, addresses)
+- Descriptive body text or explanations
+- Repeated boilerplate or footer text
+- Page numbers or document references like "Page 1 of 5"
+
+QUALITY CHECKS:
+- Headings/subheadings are typically SHORT (1-6 words)
+- They appear visually distinct (bold, caps, numbered, or isolated)
+- They LABEL or ORGANIZE content, not describe it
+- Preserve EXACT wording - no paraphrasing
+- Multiple headings/subheadings per page are EXPECTED
+- If nothing qualifies, return empty arrays
 
 Return VALID JSON ONLY."""
 
@@ -325,7 +327,11 @@ Return VALID JSON ONLY."""
             user_prompt = f"""PAGE {page_num} TEXT (verbatim from OCR):
 {page_text}
 
-Extract ALL headings and subheadings for THIS page. Be comprehensive - capture all organizational text, labels, and section markers. Do not miss form labels, category headers, or any text that structures the content."""
+Extract ALL headings and subheadings from THIS page only. Remember:
+- Headings = main section labels/titles (short, organizing major content)
+- Subheadings = secondary labels under those sections (numbered clauses, nested labels)
+- Exclude body paragraphs and data values
+- Include multiple headings if the page has multiple sections"""
 
             try:
                 response = client.chat.completions.create(
