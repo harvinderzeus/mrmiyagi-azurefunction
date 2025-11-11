@@ -475,6 +475,203 @@ Here are the pages to analyze:
         raise
 
 
+def convert_page_to_markdown(page_text: str, page_number: int) -> str:
+    """
+    Convert a single page's text to markdown using OpenAI
+    """
+    system_prompt = """You are a document formatting expert. Convert the provided document page text into clean, well-structured Markdown format.
+
+RULES:
+- Preserve the document's structure and hierarchy
+- Use appropriate markdown headers (##, ###, ####) for titles and sections
+- Use bullet points or numbered lists where appropriate
+- Preserve tables in markdown table format if present
+- Use **bold** for emphasis where the original document uses bold text
+- Use *italics* for emphasis where appropriate
+- Keep the content accurate and complete
+- Do not add any content that isn't in the original
+- Return ONLY the markdown content, no explanations or preambles"""
+
+    user_prompt = f"""Convert the following page text to markdown:
+
+PAGE {page_number}:
+{page_text}
+
+Return clean markdown format only."""
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1
+        )
+
+        markdown_content = response.choices[0].message.content
+        return markdown_content
+
+    except Exception as e:
+        logging.error(
+            f"Error converting page {page_number} to markdown: {str(e)}")
+        # Fallback: return plain text with page header
+        return f"## Page {page_number}\n\n{page_text}\n\n"
+
+
+@app.route(route="markdown", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def convert_to_markdown(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    API 4 - Convert to Markdown
+    Input: 
+        - extracted_json_path: Path to extracted JSON from Document Intelligence
+    Output: 
+        - Path to generated markdown file
+        - Success status
+    
+    Example request body:
+    {
+        "extracted_json_path": "dev-mr-miyagi/outcome/file1/file1-extracted.json"
+    }
+    """
+    logging.info("API 4: Convert to Markdown - HTTP trigger called")
+
+    try:
+        # Parse request
+        try:
+            req_body = req.get_json()
+        except ValueError as e:
+            logging.error(f"Invalid JSON in request: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        extracted_json_path = req_body.get('extracted_json_path')
+
+        if not extracted_json_path:
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": "Missing 'extracted_json_path' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        logging.info(f"Processing extracted JSON: {extracted_json_path}")
+
+        # Read extracted JSON from blob
+        if extracted_json_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+            blob_name = extracted_json_path[len(STORAGE_CONTAINER_NAME)+1:]
+        else:
+            blob_name = extracted_json_path
+
+        try:
+            blob_client = get_blob_client(blob_name)
+            extracted_data_str = blob_client.download_blob().readall().decode('utf-8')
+            pages_data = json.loads(extracted_data_str)
+            logging.info(
+                f"Successfully loaded extracted JSON with {len(pages_data)} pages")
+        except Exception as e:
+            logging.error(f"Failed to read extracted JSON: {str(e)}")
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": f"Failed to read extracted JSON: {str(e)}"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Convert string keys to int for page numbers
+        pages_data = {int(k): v for k, v in pages_data.items()}
+
+        # Build markdown content
+        markdown_content = []
+        markdown_content.append("# Document Content\n\n")
+        markdown_content.append(f"*Total Pages: {len(pages_data)}*\n\n")
+        markdown_content.append("---\n\n")
+
+        # Process each page
+        for page_num in sorted(pages_data.keys()):
+            logging.info(f"Converting page {page_num} to markdown...")
+
+            page_text = pages_data[page_num].get("full_text", "")
+
+            if not page_text.strip():
+                logging.warning(f"Page {page_num} has no text content")
+                markdown_content.append(
+                    f"## Page {page_num}\n\n*[No text content]*\n\n---\n\n")
+                continue
+
+            # Convert page to markdown
+            page_markdown = convert_page_to_markdown(page_text, page_num)
+
+            # Add page separator
+            markdown_content.append(f"{page_markdown}\n\n---\n\n")
+
+        # Combine all markdown content
+        final_markdown = "".join(markdown_content)
+
+        # Generate output path
+        # Extract base filename from blob path
+        # Example: outcome/file1/file1-extracted.json -> file1
+        path_parts = blob_name.split('/')
+        if len(path_parts) >= 2:
+            folder_name = path_parts[-2]  # Get the folder name (e.g., file1)
+            base_filename = folder_name
+        else:
+            base_filename = os.path.basename(
+                blob_name).replace('-extracted.json', '')
+
+        # Save markdown to blob: outcome/file1/file1-markdown.md
+        output_blob_name = f"outcome/{base_filename}/{base_filename}-markdown.md"
+
+        try:
+            output_blob_client = get_blob_client(output_blob_name)
+            output_blob_client.upload_blob(final_markdown, overwrite=True)
+
+            output_path = f"{STORAGE_CONTAINER_NAME}/{output_blob_name}"
+            blob_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_NAME}/{output_blob_name}"
+
+            logging.info(f"Successfully saved markdown to: {output_path}")
+        except Exception as e:
+            logging.error(f"Failed to save markdown file: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to save markdown: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Return success response
+        response_data = {
+            "status": "success",
+            "message": f"Successfully converted {len(pages_data)} pages to markdown",
+            "source_json": extracted_json_path,
+            "markdown_path": output_path,
+            "blob_url": blob_url,
+            "total_pages": len(pages_data)
+        }
+
+        logging.info("Markdown conversion completed successfully")
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(
+            f"Unexpected error in convert_to_markdown: {str(e)}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"error": f"Internal server error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
 # ============= HTTP TRIGGER FUNCTIONS =============
 
 @app.route(route="classify", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
