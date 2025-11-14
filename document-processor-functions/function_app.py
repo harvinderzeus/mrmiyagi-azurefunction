@@ -611,9 +611,10 @@ def convert_to_markdown(req: func.HttpRequest) -> func.HttpResponse:
             # Convert page to markdown
             page_markdown = convert_page_to_markdown(page_text, page_num)
 
-            # Add page separator
-            markdown_content.append(f"{page_markdown}\n\n---\n\n")
-
+            # Add explicit page number heading BEFORE LLM markdown
+            markdown_content.append(f"## Page {page_num}\n\n")
+            markdown_content.append(page_markdown)
+            markdown_content.append("\n\n---\n\n")
         # Combine all markdown content
         final_markdown = "".join(markdown_content)
 
