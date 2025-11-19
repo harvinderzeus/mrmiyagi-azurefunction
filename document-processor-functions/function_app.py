@@ -909,10 +909,200 @@ def split_document(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+# @app.route(route="structure", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+# def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
+#     """
+#     API 3 - Structure (Headings & Subheadings with Metadata)
+#     Input: 
+#         - classification: Classification response
+#         - extracted_json_path: Path to extracted JSON
+#         - items_to_extract: List of dicts with format:
+#             [
+#                 {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+#                 {"search_key": "customer", "variable_name": "customer", "type": "single"},
+#                 {"search_key": "price", "variable_name": "prices", "type": "list"}
+#             ]
+#     Output: Structured response with document type, headings, subheadings, page numbers, and metadata per chunk
+#     """
+#     logging.info("API 3: Structure - HTTP trigger called")
+
+#     try:
+#         req_body = req.get_json()
+#         classification = req_body.get('classification')
+#         extracted_json_path = req_body.get('extracted_json_path')
+#         items_to_extract = req_body.get(
+#             'items_to_extract')  # New format: list of dicts
+
+#         if not classification or not extracted_json_path:
+#             return func.HttpResponse(
+#                 json.dumps({
+#                     "error": "Missing 'classification' or 'extracted_json_path' in request body"
+#                 }),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Read extracted JSON from blob
+#         if extracted_json_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+#             blob_name = extracted_json_path[len(STORAGE_CONTAINER_NAME)+1:]
+#         else:
+#             blob_name = extracted_json_path
+
+#         blob_client = get_blob_client(blob_name)
+#         extracted_data_str = blob_client.download_blob().readall().decode('utf-8')
+#         pages_data = json.loads(extracted_data_str)
+
+#         # Convert string keys to int for page numbers
+#         pages_data = {int(k): v for k, v in pages_data.items()}
+
+#         structured_results = []
+
+#         # Process each document section
+#         for doc_type, sections in classification.items():
+#             for section in sections:
+#                 start_page = section.get("start_page")
+#                 end_page = section.get("end_page")
+
+#                 if start_page is None or end_page is None:
+#                     continue
+
+#                 # Identify headings and subheadings with metadata for this section
+#                 page_structures = identify_headings_and_subheadings(
+#                     pages_data,
+#                     doc_type,
+#                     (start_page, end_page),
+#                     items_to_extract
+#                 )
+
+#                 # Build structured output
+#                 for page_struct in page_structures:
+#                     result_entry = {
+#                         "document_type": doc_type,
+#                         "page_number": page_struct.get("page_number"),
+#                         "heading": page_struct.get("heading", doc_type),
+#                         "subheading": page_struct.get("subheading"),
+#                         # Metadata for chunk
+#                         "metadata": page_struct.get("metadata", {}),
+#                         "confidence": section.get("confidence"),
+#                         "description": section.get("description")
+#                     }
+
+#                     structured_results.append(result_entry)
+
+#         return func.HttpResponse(
+#             json.dumps({
+#                 "status": "success",
+#                 "total_pages_analyzed": len(structured_results),
+#                 "structure": structured_results
+#             }, indent=2),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error in analyze_structure: {str(e)}")
+#         return func.HttpResponse(
+#             json.dumps({"error": f"Processing error: {str(e)}"}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
+def extract_items_from_pages_only(pages_data: Dict[int, Any], page_range: tuple, items_config: List[Dict]) -> Dict:
+    """
+    Extract specific items from pages using AI
+    
+    Args:
+        pages_data: Dictionary of page data
+        page_range: Tuple of (start_page, end_page)
+        items_config: List of dictionaries with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
+    
+    Returns:
+        Dictionary with extracted items using variable_name as keys
+    """
+    start_page, end_page = page_range
+
+    if not items_config:
+        return {}
+
+    # Build the system prompt
+    system_prompt = """You are a precise data extraction specialist.
+Extract the requested items from the document pages.
+
+IMPORTANT RULES:
+- For 'single' type items: Extract only ONE value (the most prominent/relevant one across all pages)
+- For 'list' type items: Extract ALL occurrences found across all pages as an array
+- Return null for items not found
+- Extract exact values as they appear in the document
+- Do not invent or infer values
+
+ONLY return a valid JSON object with this structure:
+{
+  "extracted_items": {
+    "variable_name": "value for single items" OR ["value1", "value2"] for list items,
+    ...
+  }
+}"""
+
+    # Build items description for the prompt
+    items_desc = "\n".join([
+        f"- Search for '{item['search_key']}' and store as '{item['variable_name']}' (type: {item['type']})"
+        for item in items_config
+    ])
+
+    # Collect text from all pages in range
+    pages_text = ""
+    for page_num in range(start_page, end_page + 1):
+        if page_num in pages_data:
+            pages_text += f"\n--- PAGE {page_num} ---\n{pages_data[page_num]['full_text']}\n"
+
+    user_prompt = f"""Extract the following items from the document pages:
+
+{items_desc}
+
+Document text:
+{pages_text}
+
+Return the extracted items in JSON format using the variable names as keys."""
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.choices[0].message.content
+        result_json = json.loads(result_text)
+
+        extracted_items = result_json.get("extracted_items", {})
+        logging.info(f"Successfully extracted {len(extracted_items)} items")
+
+        return extracted_items
+
+    except Exception as e:
+        logging.error(f"Error extracting items: {str(e)}")
+        # Return empty dict with null values for all requested items
+        return {item['variable_name']: None for item in items_config}
+
+
 @app.route(route="structure", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
 def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
     """
-    API 3 - Structure (Headings & Subheadings with Metadata)
+    API 3 - Structure (Metadata Extraction Only)
     Input: 
         - classification: Classification response
         - extracted_json_path: Path to extracted JSON
@@ -922,7 +1112,7 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
                 {"search_key": "customer", "variable_name": "customer", "type": "single"},
                 {"search_key": "price", "variable_name": "prices", "type": "list"}
             ]
-    Output: Structured response with document type, headings, subheadings, page numbers, and metadata per chunk
+    Output: Structured response with document type, page range, and extracted metadata
     """
     logging.info("API 3: Structure - HTTP trigger called")
 
@@ -930,8 +1120,7 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
         req_body = req.get_json()
         classification = req_body.get('classification')
         extracted_json_path = req_body.get('extracted_json_path')
-        items_to_extract = req_body.get(
-            'items_to_extract')  # New format: list of dicts
+        items_to_extract = req_body.get('items_to_extract')
 
         if not classification or not extracted_json_path:
             return func.HttpResponse(
@@ -966,33 +1155,34 @@ def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
                 if start_page is None or end_page is None:
                     continue
 
-                # Identify headings and subheadings with metadata for this section
-                page_structures = identify_headings_and_subheadings(
-                    pages_data,
-                    doc_type,
-                    (start_page, end_page),
-                    items_to_extract
-                )
+                # Extract metadata for this section only
+                metadata = {}
+                if items_to_extract:
+                    metadata = extract_items_from_pages_only(
+                        pages_data,
+                        (start_page, end_page),
+                        items_to_extract
+                    )
+                    logging.info(
+                        f"Extracted metadata for {doc_type}: {list(metadata.keys())}")
 
-                # Build structured output
-                for page_struct in page_structures:
-                    result_entry = {
-                        "document_type": doc_type,
-                        "page_number": page_struct.get("page_number"),
-                        "heading": page_struct.get("heading", doc_type),
-                        "subheading": page_struct.get("subheading"),
-                        # Metadata for chunk
-                        "metadata": page_struct.get("metadata", {}),
-                        "confidence": section.get("confidence"),
-                        "description": section.get("description")
-                    }
+                # Build structured output - one entry per section with metadata
+                result_entry = {
+                    "document_type": doc_type,
+                    "start_page": start_page,
+                    "end_page": end_page,
+                    "page_count": end_page - start_page + 1,
+                    "metadata": metadata,
+                    "confidence": section.get("confidence"),
+                    "description": section.get("description")
+                }
 
-                    structured_results.append(result_entry)
+                structured_results.append(result_entry)
 
         return func.HttpResponse(
             json.dumps({
                 "status": "success",
-                "total_pages_analyzed": len(structured_results),
+                "total_sections_analyzed": len(structured_results),
                 "structure": structured_results
             }, indent=2),
             status_code=200,
