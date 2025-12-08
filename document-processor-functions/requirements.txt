@@ -10,3 +10,5 @@ requests
 python-dotenv
 azure-storage-blob
 PyMuPDF
+tiktoken
+azure-eventhub
