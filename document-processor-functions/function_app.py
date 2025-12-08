@@ -9,9 +9,6 @@ from openai import AzureOpenAI
 from azure.storage.blob import BlobServiceClient
 import os
 from typing import Dict, List, Any
-from datetime import datetime
-import uuid
-from azure.eventhub import EventHubProducerClient, EventData
 
 
 # ============= CONFIGURATION =============
@@ -26,62 +23,7 @@ STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME", "sadevmrmiyagi")
 STORAGE_ACCOUNT_KEY = os.environ.get("STORAGE_ACCOUNT_KEY", "")
 STORAGE_CONTAINER_NAME = "dev-mr-miyagi"
 
-# Event Hub Configuration for Logging
-EVENT_HUB_CONNECTION_STRING = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
-EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "dev-mrmiyagi-logs")
-
 app = func.FunctionApp()
-
-# Generate unique run ID for each function execution
-RUN_ID = None
-JOB_ID = "azure_function"
-
-
-# ============= LOGGING FUNCTION =============
-
-def log_event(topic, sub_topic, message, status="info", file_name=None, error_details=None,
-              total_pages=None, input_tokens=None, output_tokens=None, embedding_tokens=None, api_call=None):
-    """Log an event to Event Hub"""
-
-    global RUN_ID
-    if RUN_ID is None:
-        RUN_ID = f"run_{str(uuid.uuid4())}"
-
-    # Create log entry
-    log_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "run_id": RUN_ID,
-        "job_id": JOB_ID,
-        "status": status,
-        "topic": topic,
-        "sub_topic": sub_topic,
-        "file_name": file_name,
-        "message": message,
-        "error_details": error_details,
-        "total_pages": total_pages,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "embedding_tokens": embedding_tokens,
-        "api_calls": api_call
-    }
-
-    # Send to Event Hub
-    if EVENT_HUB_CONNECTION_STRING:
-        try:
-            producer = EventHubProducerClient.from_connection_string(
-                conn_str=EVENT_HUB_CONNECTION_STRING,
-                eventhub_name=EVENT_HUB_NAME
-            )
-            with producer:
-                event_data_batch = producer.create_batch()
-                event_data_batch.add(EventData(json.dumps(log_entry)))
-                producer.send_batch(event_data_batch)
-            logging.info(f"[LOG SENT] {topic} - {sub_topic}")
-        except Exception as e:
-            logging.error(f"[LOG ERROR] Failed to send to Event Hub: {e}")
-            logging.info(f"[LOG FALLBACK] {json.dumps(log_entry)}")
-    else:
-        logging.info(f"[LOG] {json.dumps(log_entry)}")
 
 
 # ============= HELPER FUNCTIONS =============
@@ -94,10 +36,10 @@ def get_blob_client(blob_name: str):
     return blob_service_client.get_blob_client(container=STORAGE_CONTAINER_NAME, blob=blob_name)
 
 
-def read_file_from_blob(file_path: str) -> bytes:
+def read_pdf_from_blob(file_path: str) -> bytes:
     """
-    Read file from blob storage (PDF or Markdown)
-    Expected format: dev-mr-miyagi/files/file1.pdf or dev-mr-miyagi/files/file1.md
+    Read PDF from blob storage
+    Expected format: dev-mr-miyagi/files/file1.pdf
     """
     try:
         # Remove container name prefix if present
@@ -107,39 +49,17 @@ def read_file_from_blob(file_path: str) -> bytes:
             blob_name = file_path
 
         blob_client = get_blob_client(blob_name)
-        file_bytes = blob_client.download_blob().readall()
-
-        log_event(
-            topic="file_operations",
-            sub_topic="read_blob",
-            message=f"Successfully read file from blob: {blob_name}",
-            status="success",
-            file_name=blob_name
-        )
-
-        return file_bytes
+        pdf_bytes = blob_client.download_blob().readall()
+        logging.info(f"Successfully read PDF from blob: {blob_name}")
+        return pdf_bytes
     except Exception as e:
-        log_event(
-            topic="file_operations",
-            sub_topic="read_blob",
-            message=f"Error reading file from blob storage",
-            status="error",
-            file_name=file_path,
-            error_details=str(e)
-        )
+        logging.error(f"Error reading PDF from blob storage: {str(e)}")
         raise
 
 
 def extract_text_with_document_intelligence(pdf_bytes: bytes) -> Dict[int, Any]:
     """Extract text from PDF using Azure Document Intelligence"""
     try:
-        log_event(
-            topic="document_intelligence",
-            sub_topic="extraction_start",
-            message="Starting text extraction with Document Intelligence",
-            status="info"
-        )
-
         client = DocumentAnalysisClient(
             endpoint=FORM_RECOGNIZER_ENDPOINT,
             credential=AzureKeyCredential(FORM_RECOGNIZER_KEY)
@@ -174,95 +94,29 @@ def extract_text_with_document_intelligence(pdf_bytes: bytes) -> Dict[int, Any]:
             page_info["full_text"] = "\n".join(page_info["text"])
             pages_data[page_num] = page_info
 
-        log_event(
-            topic="document_intelligence",
-            sub_topic="extraction_complete",
-            message=f"Successfully extracted text from {len(pages_data)} pages",
-            status="success",
-            total_pages=len(pages_data),
-            api_call="begin_analyze_document"
-        )
-
+        logging.info(f"Extracted text from {len(pages_data)} pages")
         return pages_data
 
     except Exception as e:
-        log_event(
-            topic="document_intelligence",
-            sub_topic="extraction_error",
-            message="Error in document intelligence extraction",
-            status="error",
-            error_details=str(e),
-            api_call="begin_analyze_document"
-        )
+        logging.error(f"Error in document intelligence extraction: {str(e)}")
         raise
 
 
-def extract_markdown_with_document_intelligence(pdf_bytes: bytes) -> str:
-    """Extract markdown from PDF using Azure Document Intelligence with markdown output"""
-    try:
-        log_event(
-            topic="document_intelligence",
-            sub_topic="markdown_extraction_start",
-            message="Starting markdown extraction with Document Intelligence",
-            status="info"
-        )
-
-        client = DocumentAnalysisClient(
-            endpoint=FORM_RECOGNIZER_ENDPOINT,
-            credential=AzureKeyCredential(FORM_RECOGNIZER_KEY)
-        )
-
-        # Use markdown output format
-        poller = client.begin_analyze_document(
-            model_id="prebuilt-layout",
-            document=pdf_bytes,
-            output_content_format="markdown"
-        )
-        result = poller.result()
-
-        # Get markdown content
-        markdown_content = result.content if hasattr(result, 'content') else ""
-
-        log_event(
-            topic="document_intelligence",
-            sub_topic="markdown_extraction_complete",
-            message=f"Successfully extracted markdown content ({len(markdown_content)} chars)",
-            status="success",
-            api_call="begin_analyze_document"
-        )
-
-        return markdown_content
-
-    except Exception as e:
-        log_event(
-            topic="document_intelligence",
-            sub_topic="markdown_extraction_error",
-            message="Error in markdown extraction",
-            status="error",
-            error_details=str(e),
-            api_call="begin_analyze_document"
-        )
-        raise
-
-
-def save_extracted_json(file_path: str, extraction_data: Dict, output_folder: str = None) -> str:
+def save_extracted_json(file_path: str, extraction_data: Dict) -> str:
     """
     Save extraction data to blob storage
     Input: dev-mr-miyagi/files/file1.pdf
-    Output: dev-mr-miyagi/outcome/file1/file1-extracted.json (or custom output_folder)
+    Output: dev-mr-miyagi/outcome/file1/file1-extracted.json
     """
     try:
         # Extract filename without extension
         if file_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
             file_path = file_path[len(STORAGE_CONTAINER_NAME)+1:]
 
-        filename = os.path.basename(file_path).rsplit('.', 1)[0]
+        filename = os.path.basename(file_path).replace('.pdf', '')
 
         # Create output path
-        if output_folder:
-            output_blob_name = f"{output_folder}/{filename}-extracted.json"
-        else:
-            output_blob_name = f"outcome/{filename}/{filename}-extracted.json"
+        output_blob_name = f"outcome/{filename}/{filename}-extracted.json"
 
         # Upload JSON
         blob_client = get_blob_client(output_blob_name)
@@ -270,26 +124,11 @@ def save_extracted_json(file_path: str, extraction_data: Dict, output_folder: st
         blob_client.upload_blob(json_data, overwrite=True)
 
         output_path = f"{STORAGE_CONTAINER_NAME}/{output_blob_name}"
-
-        log_event(
-            topic="file_operations",
-            sub_topic="save_json",
-            message=f"Saved extracted JSON to: {output_path}",
-            status="success",
-            file_name=output_blob_name
-        )
-
+        logging.info(f"Saved extracted JSON to: {output_path}")
         return output_path
 
     except Exception as e:
-        log_event(
-            topic="file_operations",
-            sub_topic="save_json_error",
-            message="Error saving extracted JSON",
-            status="error",
-            file_name=file_path,
-            error_details=str(e)
-        )
+        logging.error(f"Error saving extracted JSON: {str(e)}")
         raise
 
 
@@ -314,199 +153,67 @@ def format_classification_results(classification_result: Dict) -> Dict:
     return formatted
 
 
-def classify_documents_with_ai(content: str, document_types: List[str] = None, is_markdown: bool = False) -> Dict:
+def extract_items_from_pages(pages_data: Dict[int, Any], page_range: tuple, items_config: List[Dict]) -> Dict:
     """
-    Use OpenAI to classify document types
-    Accepts either pages_data dict or markdown string
+    Extract specific items from pages using AI
+    
+    Args:
+        pages_data: Dictionary of page data
+        page_range: Tuple of (start_page, end_page)
+        items_config: List of dictionaries with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
+    
+    Returns:
+        Dictionary with extracted items using variable_name as keys
     """
+    start_page, end_page = page_range
 
-    log_event(
-        topic="ai_classification",
-        sub_topic="classification_start",
-        message="Starting document classification",
-        status="info"
-    )
+    if not items_config:
+        return {}
 
-    base_prompt = """You are a document classification expert. Analyze the following document and identify different document types within it.
+    # Build the system prompt
+    system_prompt = """You are a precise data extraction specialist.
+Extract the requested items from the document pages.
 
-Your task:
-1. Read through the content and identify distinct document types
-2. For multi-page PDFs: Group consecutive pages that belong to the same document and provide page ranges
-3. For markdown: Identify sections based on content structure and headings
-4. Provide clear boundaries for each document type
-5. If you cannot identify a document type, classify it as "Other"
+IMPORTANT RULES:
+- For 'single' type items: Extract only ONE value (the most prominent/relevant one across all pages)
+- For 'list' type items: Extract ALL occurrences found across all pages as an array
+- Return null for items not found
+- Extract exact values as they appear in the document
+- Do not invent or infer values
 
-"""
-
-    if document_types:
-        types_str = ", ".join(document_types)
-        base_prompt += f"\nLook specifically for these document types: {types_str}\n"
-    else:
-        base_prompt += "\nCommon document types to look for include: closed deal sheet, MESA (Master Equipment Sale Agreement), emails, contracts, invoices, agreements, correspondence, forms, reports, etc.\n"
-
-    if is_markdown:
-        base_prompt += """
-For markdown content, return your response as a JSON object with this structure:
+ONLY return a valid JSON object with this structure:
 {
-    "documents": [
-        {
-            "document_type": "name of document type",
-            "section_start": "heading or marker where section starts",
-            "section_end": "heading or marker where section ends",
-            "confidence": "high/medium/low",
-            "description": "brief description of what was found"
-        }
-    ]
-}
-"""
-    else:
-        base_prompt += """
-For PDF content, return your response as a JSON object with this structure:
-{
-    "documents": [
-        {
-            "document_type": "name of document type",
-            "start_page": 1,
-            "end_page": 3,
-            "confidence": "high/medium/low",
-            "description": "brief description of what was found"
-        }
-    ]
-}
-"""
-
-    base_prompt += f"\n\nHere is the content to analyze:\n\n{content[:15000]}\n"
-
-    try:
-        client = AzureOpenAI(
-            azure_endpoint=OPENAI_ENDPOINT,
-            api_key=OPENAI_API_KEY,
-            api_version="2025-01-01-preview"
-        )
-
-        response = client.chat.completions.create(
-            model=OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": "You are a document classification expert. Always respond with valid JSON."},
-                {"role": "user", "content": base_prompt}
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
-
-        result_text = response.choices[0].message.content
-        result_json = json.loads(result_text)
-
-        # Track token usage
-        usage = response.usage
-        log_event(
-            topic="ai_classification",
-            sub_topic="classification_complete",
-            message="Document classification completed successfully",
-            status="success",
-            input_tokens=usage.prompt_tokens if usage else None,
-            output_tokens=usage.completion_tokens if usage else None,
-            api_call="chat.completions.create"
-        )
-
-        if "documents" not in result_json:
-            result_json = {"documents": []}
-
-        return result_json
-
-    except Exception as e:
-        log_event(
-            topic="ai_classification",
-            sub_topic="classification_error",
-            message="Error in AI classification",
-            status="error",
-            error_details=str(e),
-            api_call="chat.completions.create"
-        )
-        raise
-
-
-def extract_key_value_pairs_with_ai(content: str, file_name: str = None) -> Dict:
-    """
-    Extract all key-value pairs from document including tables using LLM
-    Content-aware extraction that understands document context
-    """
-
-    log_event(
-        topic="key_value_extraction",
-        sub_topic="extraction_start",
-        message="Starting key-value pair extraction",
-        status="info",
-        file_name=file_name
-    )
-
-    system_prompt = """You are an expert document data extraction specialist. Extract ALL key-value pairs from the document in a structured, intelligent manner.
-
-EXTRACTION RULES:
-1. **Form Fields**: Extract all labeled fields (e.g., "Name: John Doe" → {"Name": "John Doe"})
-2. **Tables**: Convert tables to nested structures with row/column relationships
-3. **Sections**: Group related data under section headers as nested objects
-4. **Lists**: Extract bulleted/numbered lists as arrays
-5. **Metadata**: Extract dates, reference numbers, document IDs, signatures
-6. **Smart Context**: Use document context to infer field meanings and relationships
-7. **Data Types**: Preserve appropriate types (strings, numbers, dates, booleans, arrays, objects)
-
-TABLE HANDLING:
-- For simple tables: Create array of objects with column headers as keys
-- For complex tables: Create nested structure preserving hierarchy
-- For financial tables: Preserve numerical precision and currency
-
-OUTPUT FORMAT:
-Return a JSON object with this structure:
-{
-  "document_metadata": {
-    "document_type": "string",
-    "document_id": "string or null",
-    "date": "string or null",
-    "total_sections": number
-  },
-  "extracted_data": {
-    "section_name": {
-      "field_name": "value",
-      "nested_field": {...},
-      "table_name": [
-        {"column1": "value", "column2": "value"},
-        ...
-      ]
-    },
+  "extracted_items": {
+    "variable_name": "value for single items" OR ["value1", "value2"] for list items,
     ...
-  },
-  "tables": [
-    {
-      "table_name": "string",
-      "headers": ["col1", "col2", ...],
-      "rows": [
-        {"col1": "val1", "col2": "val2"},
-        ...
-      ]
-    }
-  ],
-  "key_entities": {
-    "parties": ["entity1", "entity2"],
-    "amounts": [{"description": "string", "value": number, "currency": "string"}],
-    "dates": [{"label": "string", "date": "string"}]
   }
-}
+}"""
 
-IMPORTANT:
-- Extract EVERYTHING - no data should be left behind
-- Be smart about grouping related information
-- Preserve document structure and hierarchy
-- Use clear, descriptive key names
-- Handle missing values as null
-- For ambiguous data, use best judgment based on context"""
+    # Build items description for the prompt
+    items_desc = "\n".join([
+        f"- Search for '{item['search_key']}' and store as '{item['variable_name']}' (type: {item['type']})"
+        for item in items_config
+    ])
 
-    user_prompt = f"""Extract all key-value pairs from the following document. Be thorough and context-aware.
+    # Collect text from all pages in range
+    pages_text = ""
+    for page_num in range(start_page, end_page + 1):
+        if page_num in pages_data:
+            pages_text += f"\n--- PAGE {page_num} ---\n{pages_data[page_num]['full_text']}\n"
 
-DOCUMENT CONTENT:
-{content}
+    user_prompt = f"""Extract the following items from the document pages:
 
-Return comprehensive extraction in the specified JSON format."""
+{items_desc}
+
+Document text:
+{pages_text}
+
+Return the extracted items in JSON format using the variable names as keys."""
 
     try:
         client = AzureOpenAI(
@@ -528,28 +235,964 @@ Return comprehensive extraction in the specified JSON format."""
         result_text = response.choices[0].message.content
         result_json = json.loads(result_text)
 
-        usage = response.usage
-        log_event(
-            topic="key_value_extraction",
-            sub_topic="extraction_complete",
-            message="Successfully extracted key-value pairs",
-            status="success",
-            file_name=file_name,
-            input_tokens=usage.prompt_tokens if usage else None,
-            output_tokens=usage.completion_tokens if usage else None,
-            api_call="chat.completions.create"
+        extracted_items = result_json.get("extracted_items", {})
+        logging.info(f"Successfully extracted {len(extracted_items)} items")
+
+        return extracted_items
+
+    except Exception as e:
+        logging.error(f"Error extracting items: {str(e)}")
+        # Return empty dict with null values for all requested items
+        return {item['variable_name']: None for item in items_config}
+
+
+def identify_headings_and_subheadings(pages_data: Dict[int, Any], document_type: str, page_range: tuple, items_config: List[Dict] = None) -> List[Dict]:
+    """
+    Use AI to identify headings and subheadings for pages in a document section
+    Optionally extract specific items and add as metadata to each chunk
+    """
+    start_page, end_page = page_range
+
+    system_prompt = """You are a precise document-structure analyst. Extract ALL structural elements that organize content.
+
+ONLY return a single JSON object with this exact schema:
+{
+  "page": <int>,
+  "headings": ["<string>", "..."],
+  "subheadings": ["<string>", "..."]
+}
+
+DEFINITION OF HEADINGS (Primary organizational markers):
+- Document titles, section titles (e.g., "TERMS AND CONDITIONS", "ARTICLE I")
+- Major section headers with numbers (e.g., "1. Definitions", "Section 2")
+- Bold/all-caps standalone labels that organize major sections
+- Top-level form section labels (e.g., "Customer Information", "Broker Details", "Coverage Summary")
+- Main category headers that group related content
+
+DEFINITION OF SUBHEADINGS (Secondary organizational markers):
+- Subsection numbers under headings (e.g., "1.1 Interpretation", "2.a")
+- Clause titles or labels under main sections
+- Nested form labels (e.g., under "Customer Information": "Primary Contact", "Billing Address")
+- Exhibit or schedule references (e.g., "Exhibit A", "Schedule 1")
+- Table column headers or row labels
+
+EXCLUSION RULES - DO NOT INCLUDE:
+- Full sentences or narrative paragraphs (5+ words forming a complete thought)
+- Data values or filled-in information (names, dates, amounts, addresses)
+- Descriptive body text or explanations
+- Repeated boilerplate or footer text
+- Page numbers or document references like "Page 1 of 5"
+
+QUALITY CHECKS:
+- Headings/subheadings are typically SHORT (1-6 words)
+- They appear visually distinct (bold, caps, numbered, or isolated)
+- They LABEL or ORGANIZE content, not describe it
+- Preserve EXACT wording - no paraphrasing
+- Multiple headings/subheadings per page are EXPECTED
+- If nothing qualifies, return empty arrays
+
+Return VALID JSON ONLY."""
+
+    results = []
+
+    # Extract items once for the entire section if items_config is provided
+    metadata = {}
+    if items_config:
+        extracted_items = extract_items_from_pages(
+            pages_data, page_range, items_config)
+        metadata = extracted_items
+        logging.info(
+            f"Extracted metadata for section: {list(metadata.keys())}")
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
         )
 
+        # Process each page individually
+        for page_num in range(start_page, end_page + 1):
+            if page_num not in pages_data:
+                results.append({
+                    "page_number": page_num,
+                    "heading": document_type,
+                    "subheading": None,
+                    "metadata": metadata  # Add metadata to every chunk
+                })
+                continue
+
+            page_text = pages_data[page_num]["full_text"]
+
+            user_prompt = f"""PAGE {page_num} TEXT (verbatim from OCR):
+{page_text}
+
+Extract ALL headings and subheadings from THIS page only. Remember:
+- Headings = main section labels/titles (short, organizing major content)
+- Subheadings = secondary labels under those sections (numbered clauses, nested labels)
+- Exclude body paragraphs and data values
+- Include multiple headings if the page has multiple sections"""
+
+            try:
+                response = client.chat.completions.create(
+                    model=OPENAI_DEPLOYMENT,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.1,  # Reduced from 0.2 for more consistent extraction
+                    response_format={"type": "json_object"}
+                )
+
+                result_text = response.choices[0].message.content
+                result_json = json.loads(result_text)
+
+                # Convert the response format to match your existing structure
+                headings = result_json.get("headings", [])
+                subheadings = result_json.get("subheadings", [])
+
+                results.append({
+                    "page_number": page_num,
+                    "heading": headings[0] if headings else document_type,
+                    "subheading": subheadings[0] if subheadings else None,
+                    "all_headings": headings,
+                    "all_subheadings": subheadings,
+                    "metadata": metadata  # Add metadata to every chunk
+                })
+
+            except Exception as e:
+                logging.error(f"Error processing page {page_num}: {str(e)}")
+                results.append({
+                    "page_number": page_num,
+                    "heading": document_type,
+                    "subheading": None,
+                    "metadata": metadata  # Add metadata even on error
+                })
+
+        return results
+
+    except Exception as e:
+        logging.error(f"Error identifying headings: {str(e)}")
+        # Fallback: use document type as heading
+        return [
+            {
+                "page_number": page_num,
+                "heading": document_type,
+                "subheading": None,
+                "metadata": metadata
+            }
+            for page_num in range(start_page, end_page + 1)
+        ]
+
+def classify_documents_with_ai(pages_data: Dict[int, Any], document_types: List[str] = None) -> Dict:
+    """Use OpenAI to classify document types with enhanced error handling"""
+
+    base_prompt = """You are a document classification expert. Analyze the following multi-page document and identify different document types within it.
+
+Your task:
+1. Read through all pages and identify distinct document types
+2. Group consecutive pages that belong to the same document
+3. Provide page ranges for each document type
+4. If you cannot identify a document type, classify it as "Other"
+
+"""
+
+    if document_types:
+        types_str = ", ".join(document_types)
+        base_prompt += f"\nLook specifically for these document types: {types_str}\n"
+    else:
+        base_prompt += "\nCommon document types to look for include: closed deal sheet, MESA (Master Equipment Sale Agreement), emails, contracts, invoices, agreements, correspondence, forms, reports, etc.\n"
+
+    base_prompt += """
+Return your response as a JSON object with this exact structure:
+{
+    "documents": [
+        {
+            "document_type": "name of document type",
+            "start_page": 1,
+            "end_page": 3,
+            "confidence": "high/medium/low",
+            "description": "brief description of what was found"
+        }
+    ]
+}
+
+Here are the pages to analyze:
+
+"""
+
+    for page_num in sorted(pages_data.keys()):
+        text = pages_data[page_num]["full_text"]
+        base_prompt += f"\n--- PAGE {page_num} ---\n{text[:2000]}\n"
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        logging.info("Sending classification request to OpenAI")
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "You are a document classification expert. Always respond with valid JSON."},
+                {"role": "user", "content": base_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.choices[0].message.content
+        logging.info(f"Received OpenAI response: {result_text[:200]}...")
+
+        try:
+            result_json = json.loads(result_text)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse OpenAI response as JSON: {str(e)}")
+            logging.error(f"Response text: {result_text}")
+            # Return a default structure
+            return {
+                "documents": [{
+                    "document_type": "Other",
+                    "start_page": 1,
+                    "end_page": len(pages_data),
+                    "confidence": "low",
+                    "description": "Classification failed, defaulting to single document"
+                }]
+            }
+
+        # Validate structure
+        if "documents" not in result_json:
+            logging.warning("OpenAI response missing 'documents' key")
+            result_json = {"documents": []}
+
+        logging.info("Classification completed successfully")
         return result_json
 
     except Exception as e:
-        log_event(
-            topic="key_value_extraction",
-            sub_topic="extraction_error",
-            message="Error extracting key-value pairs",
-            status="error",
-            file_name=file_name,
-            error_details=str(e),
-            api_call="chat.completions.create"
+        logging.error(f"Error in AI classification: {str(e)}", exc_info=True)
+        raise
+
+
+def convert_page_to_markdown(page_text: str, page_number: int) -> str:
+    """
+    Convert a single page's text to markdown using OpenAI
+    """
+    system_prompt = """You are a document formatting expert. Convert the provided document page text into clean, well-structured Markdown format.
+
+RULES:
+- Preserve the document's structure and hierarchy
+- Use appropriate markdown headers (##, ###, ####) for titles and sections
+- Use bullet points or numbered lists where appropriate
+- Preserve tables in markdown table format if present
+- Use **bold** for emphasis where the original document uses bold text
+- Use *italics* for emphasis where appropriate
+- Keep the content accurate and complete
+- Do not add any content that isn't in the original
+- Return ONLY the markdown content, no explanations or preambles"""
+
+    user_prompt = f"""Convert the following page text to markdown:
+
+PAGE {page_number}:
+{page_text}
+
+Return clean markdown format only."""
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
         )
-        return {"error": str(e), "extracted_data": {}}
+
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1
+        )
+
+        markdown_content = response.choices[0].message.content
+        return markdown_content
+
+    except Exception as e:
+        logging.error(
+            f"Error converting page {page_number} to markdown: {str(e)}")
+        # Fallback: return plain text with page header
+        return f"## Page {page_number}\n\n{page_text}\n\n"
+
+
+@app.route(route="markdown", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def convert_to_markdown(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    API 4 - Convert to Markdown
+    Input: 
+        - extracted_json_path: Path to extracted JSON from Document Intelligence
+    Output: 
+        - Path to generated markdown file
+        - Success status
+    
+    Example request body:
+    {
+        "extracted_json_path": "dev-mr-miyagi/outcome/file1/file1-extracted.json"
+    }
+    """
+    logging.info("API 4: Convert to Markdown - HTTP trigger called")
+
+    try:
+        # Parse request
+        try:
+            req_body = req.get_json()
+        except ValueError as e:
+            logging.error(f"Invalid JSON in request: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        extracted_json_path = req_body.get('extracted_json_path')
+
+        if not extracted_json_path:
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": "Missing 'extracted_json_path' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        logging.info(f"Processing extracted JSON: {extracted_json_path}")
+
+        # Read extracted JSON from blob
+        if extracted_json_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+            blob_name = extracted_json_path[len(STORAGE_CONTAINER_NAME)+1:]
+        else:
+            blob_name = extracted_json_path
+
+        try:
+            blob_client = get_blob_client(blob_name)
+            extracted_data_str = blob_client.download_blob().readall().decode('utf-8')
+            pages_data = json.loads(extracted_data_str)
+            logging.info(
+                f"Successfully loaded extracted JSON with {len(pages_data)} pages")
+        except Exception as e:
+            logging.error(f"Failed to read extracted JSON: {str(e)}")
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": f"Failed to read extracted JSON: {str(e)}"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Convert string keys to int for page numbers
+        pages_data = {int(k): v for k, v in pages_data.items()}
+
+        # Build markdown content
+        markdown_content = []
+        markdown_content.append("# Document Content\n\n")
+        markdown_content.append(f"*Total Pages: {len(pages_data)}*\n\n")
+        markdown_content.append("---\n\n")
+
+        # Process each page
+        for page_num in sorted(pages_data.keys()):
+            logging.info(f"Converting page {page_num} to markdown...")
+
+            page_text = pages_data[page_num].get("full_text", "")
+
+            if not page_text.strip():
+                logging.warning(f"Page {page_num} has no text content")
+                markdown_content.append(
+                    f"## Page {page_num}\n\n*[No text content]*\n\n---\n\n")
+                continue
+
+            # Convert page to markdown
+            page_markdown = convert_page_to_markdown(page_text, page_num)
+
+            # Add explicit page number heading BEFORE LLM markdown
+            markdown_content.append(f"## Page {page_num}\n\n")
+            markdown_content.append(page_markdown)
+            markdown_content.append("\n\n---\n\n")
+        # Combine all markdown content
+        final_markdown = "".join(markdown_content)
+
+        # Generate output path
+        # Extract base filename from blob path
+        # Example: outcome/file1/file1-extracted.json -> file1
+        path_parts = blob_name.split('/')
+        if len(path_parts) >= 2:
+            folder_name = path_parts[-2]  # Get the folder name (e.g., file1)
+            base_filename = folder_name
+        else:
+            base_filename = os.path.basename(
+                blob_name).replace('-extracted.json', '')
+
+        # Save markdown to blob: outcome/file1/file1-markdown.md
+        output_blob_name = f"outcome/{base_filename}/{base_filename}-markdown.md"
+
+        try:
+            output_blob_client = get_blob_client(output_blob_name)
+            output_blob_client.upload_blob(final_markdown, overwrite=True)
+
+            output_path = f"{STORAGE_CONTAINER_NAME}/{output_blob_name}"
+            blob_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_NAME}/{output_blob_name}"
+
+            logging.info(f"Successfully saved markdown to: {output_path}")
+        except Exception as e:
+            logging.error(f"Failed to save markdown file: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to save markdown: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Return success response
+        response_data = {
+            "status": "success",
+            "message": f"Successfully converted {len(pages_data)} pages to markdown",
+            "source_json": extracted_json_path,
+            "markdown_path": output_path,
+            "blob_url": blob_url,
+            "total_pages": len(pages_data)
+        }
+
+        logging.info("Markdown conversion completed successfully")
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(
+            f"Unexpected error in convert_to_markdown: {str(e)}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"error": f"Internal server error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+# ============= HTTP TRIGGER FUNCTIONS =============
+
+@app.route(route="classify", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def classify_document(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    API 1 - Classify
+    Input: File path in format dev-mr-miyagi/files/file1.pdf
+    Output: Classification result + path to extracted JSON
+    """
+    logging.info("API 1: Classify - HTTP trigger called")
+
+    try:
+        # Validate environment variables first
+        required_vars = {
+            "FORM_RECOGNIZER_ENDPOINT": FORM_RECOGNIZER_ENDPOINT,
+            "FORM_RECOGNIZER_KEY": FORM_RECOGNIZER_KEY,
+            "OPENAI_ENDPOINT": OPENAI_ENDPOINT,
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+            "STORAGE_ACCOUNT_KEY": STORAGE_ACCOUNT_KEY
+        }
+
+        missing_vars = [name for name,
+                        value in required_vars.items() if not value]
+        if missing_vars:
+            error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+            logging.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": error_msg}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Parse request body with error handling
+        try:
+            req_body = req.get_json()
+        except ValueError as e:
+            logging.error(f"Invalid JSON in request: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        file_path = req_body.get('file_path')
+        document_types = req_body.get('document_types')
+
+        if not file_path:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing 'file_path' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        logging.info(f"Processing file: {file_path}")
+
+        # Read PDF from blob storage
+        try:
+            pdf_bytes = read_pdf_from_blob(file_path)
+            logging.info(
+                f"PDF read successfully, size: {len(pdf_bytes)} bytes")
+        except Exception as e:
+            logging.error(f"Failed to read PDF from blob: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to read PDF: {str(e)}"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Extract text with Document Intelligence
+        try:
+            pages_data = extract_text_with_document_intelligence(pdf_bytes)
+            logging.info(f"Extracted {len(pages_data)} pages")
+        except Exception as e:
+            logging.error(f"Document Intelligence failed: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Text extraction failed: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Save extracted JSON
+        try:
+            extracted_json_path = save_extracted_json(file_path, pages_data)
+            logging.info(f"Saved extraction to: {extracted_json_path}")
+        except Exception as e:
+            logging.error(f"Failed to save extracted JSON: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Failed to save extraction: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Classify documents
+        try:
+            classification_result = classify_documents_with_ai(
+                pages_data, document_types)
+            logging.info("Classification completed")
+        except Exception as e:
+            logging.error(f"Classification failed: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({"error": f"Classification failed: {str(e)}"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Format results
+        formatted_results = format_classification_results(
+            classification_result)
+
+        response_data = {
+            "status": "success",
+            "file_path": file_path,
+            "total_pages": len(pages_data),
+            "classification": formatted_results,
+            "extracted_json_path": extracted_json_path
+        }
+
+        logging.info("Classification successful")
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        # Catch-all for unexpected errors
+        logging.error(
+            f"Unexpected error in classify_document: {str(e)}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"error": f"Internal server error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.route(route="split", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def split_document(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    API 2 - Split
+    Input: File path + classification response
+    Output: Split file paths + metadata
+    """
+    logging.info("API 2: Split - HTTP trigger called")
+
+    try:
+        req_body = req.get_json()
+        file_path = req_body.get('file_path')
+        classification = req_body.get('classification')
+
+        if not file_path or not classification:
+            return func.HttpResponse(
+                json.dumps(
+                    {"error": "Missing 'file_path' or 'classification' in request body"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Read PDF from blob storage
+        pdf_bytes = read_pdf_from_blob(file_path)
+        src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        # Extract base filename
+        if file_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+            file_path_clean = file_path[len(STORAGE_CONTAINER_NAME)+1:]
+        else:
+            file_path_clean = file_path
+
+        base_filename = os.path.basename(file_path_clean).replace('.pdf', '')
+
+        split_results = []
+
+        # Process each document type
+        for doc_type, sections in classification.items():
+            for seq, section in enumerate(sections, start=1):
+                start_page = section.get("start_page")
+                end_page = section.get("end_page")
+
+                if start_page is None or end_page is None:
+                    continue
+
+                # Create new PDF
+                new_pdf = fitz.open()
+                for page_num in range(start_page - 1, end_page):  # PyMuPDF is 0-indexed
+                    new_pdf.insert_pdf(
+                        src_doc, from_page=page_num, to_page=page_num)
+
+                # Generate filename: file1-{document_type}-{seq}.pdf
+                safe_doc_type = doc_type.replace(" ", "_").replace("/", "_")
+                new_filename = f"{base_filename}-{safe_doc_type}-{seq}.pdf"
+
+                # Save to outcome folder: dev-mr-miyagi/outcome/file1/file1-{document_type}-{seq}.pdf
+                output_blob_name = f"outcome/{base_filename}/{new_filename}"
+
+                # Upload to blob storage
+                pdf_bytes_out = new_pdf.tobytes()
+                blob_client = get_blob_client(output_blob_name)
+                blob_client.upload_blob(pdf_bytes_out, overwrite=True)
+
+                blob_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_NAME}/{output_blob_name}"
+
+                split_results.append({
+                    "document_type": doc_type,
+                    "sequence": seq,
+                    "start_page": start_page,
+                    "end_page": end_page,
+                    "page_count": end_page - start_page + 1,
+                    "file_path": f"{STORAGE_CONTAINER_NAME}/{output_blob_name}",
+                    "blob_url": blob_url,
+                    "confidence": section.get("confidence"),
+                    "description": section.get("description")
+                })
+
+                new_pdf.close()
+
+        src_doc.close()
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "message": f"Split into {len(split_results)} files",
+                "source_file": file_path,
+                "files": split_results
+            }, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error in split_document: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Processing error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# @app.route(route="structure", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+# def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
+#     """
+#     API 3 - Structure (Headings & Subheadings with Metadata)
+#     Input: 
+#         - classification: Classification response
+#         - extracted_json_path: Path to extracted JSON
+#         - items_to_extract: List of dicts with format:
+#             [
+#                 {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+#                 {"search_key": "customer", "variable_name": "customer", "type": "single"},
+#                 {"search_key": "price", "variable_name": "prices", "type": "list"}
+#             ]
+#     Output: Structured response with document type, headings, subheadings, page numbers, and metadata per chunk
+#     """
+#     logging.info("API 3: Structure - HTTP trigger called")
+
+#     try:
+#         req_body = req.get_json()
+#         classification = req_body.get('classification')
+#         extracted_json_path = req_body.get('extracted_json_path')
+#         items_to_extract = req_body.get(
+#             'items_to_extract')  # New format: list of dicts
+
+#         if not classification or not extracted_json_path:
+#             return func.HttpResponse(
+#                 json.dumps({
+#                     "error": "Missing 'classification' or 'extracted_json_path' in request body"
+#                 }),
+#                 status_code=400,
+#                 mimetype="application/json"
+#             )
+
+#         # Read extracted JSON from blob
+#         if extracted_json_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+#             blob_name = extracted_json_path[len(STORAGE_CONTAINER_NAME)+1:]
+#         else:
+#             blob_name = extracted_json_path
+
+#         blob_client = get_blob_client(blob_name)
+#         extracted_data_str = blob_client.download_blob().readall().decode('utf-8')
+#         pages_data = json.loads(extracted_data_str)
+
+#         # Convert string keys to int for page numbers
+#         pages_data = {int(k): v for k, v in pages_data.items()}
+
+#         structured_results = []
+
+#         # Process each document section
+#         for doc_type, sections in classification.items():
+#             for section in sections:
+#                 start_page = section.get("start_page")
+#                 end_page = section.get("end_page")
+
+#                 if start_page is None or end_page is None:
+#                     continue
+
+#                 # Identify headings and subheadings with metadata for this section
+#                 page_structures = identify_headings_and_subheadings(
+#                     pages_data,
+#                     doc_type,
+#                     (start_page, end_page),
+#                     items_to_extract
+#                 )
+
+#                 # Build structured output
+#                 for page_struct in page_structures:
+#                     result_entry = {
+#                         "document_type": doc_type,
+#                         "page_number": page_struct.get("page_number"),
+#                         "heading": page_struct.get("heading", doc_type),
+#                         "subheading": page_struct.get("subheading"),
+#                         # Metadata for chunk
+#                         "metadata": page_struct.get("metadata", {}),
+#                         "confidence": section.get("confidence"),
+#                         "description": section.get("description")
+#                     }
+
+#                     structured_results.append(result_entry)
+
+#         return func.HttpResponse(
+#             json.dumps({
+#                 "status": "success",
+#                 "total_pages_analyzed": len(structured_results),
+#                 "structure": structured_results
+#             }, indent=2),
+#             status_code=200,
+#             mimetype="application/json"
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Error in analyze_structure: {str(e)}")
+#         return func.HttpResponse(
+#             json.dumps({"error": f"Processing error: {str(e)}"}),
+#             status_code=500,
+#             mimetype="application/json"
+#         )
+def extract_items_from_pages_only(pages_data: Dict[int, Any], page_range: tuple, items_config: List[Dict]) -> Dict:
+    """
+    Extract specific items from pages using AI
+    
+    Args:
+        pages_data: Dictionary of page data
+        page_range: Tuple of (start_page, end_page)
+        items_config: List of dictionaries with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
+    
+    Returns:
+        Dictionary with extracted items using variable_name as keys
+    """
+    start_page, end_page = page_range
+
+    if not items_config:
+        return {}
+
+    # Build the system prompt
+    system_prompt = """You are a precise data extraction specialist.
+Extract the requested items from the document pages.
+
+IMPORTANT RULES:
+- For 'single' type items: Extract only ONE value (the most prominent/relevant one across all pages)
+- For 'list' type items: Extract ALL occurrences found across all pages as an array
+- Return null for items not found
+- Extract exact values as they appear in the document
+- Do not invent or infer values
+
+ONLY return a valid JSON object with this structure:
+{
+  "extracted_items": {
+    "variable_name": "value for single items" OR ["value1", "value2"] for list items,
+    ...
+  }
+}"""
+
+    # Build items description for the prompt
+    items_desc = "\n".join([
+        f"- Search for '{item['search_key']}' and store as '{item['variable_name']}' (type: {item['type']})"
+        for item in items_config
+    ])
+
+    # Collect text from all pages in range
+    pages_text = ""
+    for page_num in range(start_page, end_page + 1):
+        if page_num in pages_data:
+            pages_text += f"\n--- PAGE {page_num} ---\n{pages_data[page_num]['full_text']}\n"
+
+    user_prompt = f"""Extract the following items from the document pages:
+
+{items_desc}
+
+Document text:
+{pages_text}
+
+Return the extracted items in JSON format using the variable names as keys."""
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.choices[0].message.content
+        result_json = json.loads(result_text)
+
+        extracted_items = result_json.get("extracted_items", {})
+        logging.info(f"Successfully extracted {len(extracted_items)} items")
+
+        return extracted_items
+
+    except Exception as e:
+        logging.error(f"Error extracting items: {str(e)}")
+        # Return empty dict with null values for all requested items
+        return {item['variable_name']: None for item in items_config}
+
+
+@app.route(route="structure", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def analyze_structure(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    API 3 - Structure (Metadata Extraction Only)
+    Input: 
+        - classification: Classification response
+        - extracted_json_path: Path to extracted JSON
+        - items_to_extract: List of dicts with format:
+            [
+                {"search_key": "broker name", "variable_name": "broker", "type": "single"},
+                {"search_key": "customer", "variable_name": "customer", "type": "single"},
+                {"search_key": "price", "variable_name": "prices", "type": "list"}
+            ]
+    Output: Structured response with document type, page range, and extracted metadata
+    """
+    logging.info("API 3: Structure - HTTP trigger called")
+
+    try:
+        req_body = req.get_json()
+        classification = req_body.get('classification')
+        extracted_json_path = req_body.get('extracted_json_path')
+        items_to_extract = req_body.get('items_to_extract')
+
+        if not classification or not extracted_json_path:
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "Missing 'classification' or 'extracted_json_path' in request body"
+                }),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Read extracted JSON from blob
+        if extracted_json_path.startswith(f"{STORAGE_CONTAINER_NAME}/"):
+            blob_name = extracted_json_path[len(STORAGE_CONTAINER_NAME)+1:]
+        else:
+            blob_name = extracted_json_path
+
+        blob_client = get_blob_client(blob_name)
+        extracted_data_str = blob_client.download_blob().readall().decode('utf-8')
+        pages_data = json.loads(extracted_data_str)
+
+        # Convert string keys to int for page numbers
+        pages_data = {int(k): v for k, v in pages_data.items()}
+
+        structured_results = []
+
+        # Process each document section
+        for doc_type, sections in classification.items():
+            for section in sections:
+                start_page = section.get("start_page")
+                end_page = section.get("end_page")
+
+                if start_page is None or end_page is None:
+                    continue
+
+                # Extract metadata for this section only
+                metadata = {}
+                if items_to_extract:
+                    metadata = extract_items_from_pages_only(
+                        pages_data,
+                        (start_page, end_page),
+                        items_to_extract
+                    )
+                    logging.info(
+                        f"Extracted metadata for {doc_type}: {list(metadata.keys())}")
+
+                # Build structured output - one entry per section with metadata
+                result_entry = {
+                    "document_type": doc_type,
+                    "start_page": start_page,
+                    "end_page": end_page,
+                    "page_count": end_page - start_page + 1,
+                    "metadata": metadata,
+                    "confidence": section.get("confidence"),
+                    "description": section.get("description")
+                }
+
+                structured_results.append(result_entry)
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "total_sections_analyzed": len(structured_results),
+                "structure": structured_results
+            }, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error in analyze_structure: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Processing error: {str(e)}"}),
+            status_code=500,
+            mimetype="application/json"
+        )
