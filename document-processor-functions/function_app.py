@@ -142,12 +142,12 @@
                     poller = client.begin_analyze_document(
                         model_id="prebuilt-layout",
                         document=pdf_bytes,
-                        content_type="application/pdf",
+                        # content_type="application/pdf",
                         output_content_format="markdown"
                     )
                 else:
                     poller = client.begin_analyze_document(
-                        "prebuilt-layout", pdf_bytes)
+                        "prebuilt-layout", document=pdf_bytes)
 
                 result = poller.result()
 
