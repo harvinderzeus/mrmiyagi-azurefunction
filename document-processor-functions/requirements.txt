@@ -12,3 +12,4 @@ azure-storage-blob
 PyMuPDF
 tiktoken
 azure-eventhub
+azure-ai-documentintelligence
