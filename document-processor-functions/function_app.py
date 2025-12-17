@@ -764,78 +764,137 @@ def merge_extraction_results(results: List[Dict]) -> Dict:
 
 
 def extract_kv_and_tables_from_chunk(content: str) -> Dict:
-            """Extract key-value pairs and tables from a single chunk"""
-            system_prompt = """You are a data extraction expert. Analyze the markdown content and extract:
+    """Extract key-value pairs and tables from a single chunk"""
+    system_prompt = system_prompt = """You are a data extraction expert. Analyze the markdown content and extract:
 
-        1. KEY-VALUE PAIRS: Any meaningful data in key-value format (labels, fields, metadata, properties, etc.)
-        2. TABLES: All tables with their structure and data
+1. KEY-VALUE PAIRS:
+   - Any meaningful labeled data (fields, metadata, properties, dates, names, IDs, amounts, statuses, etc.)
+   - Normalize keys to lowercase with underscores
+   - Preserve values exactly as they appear
 
-        IMPORTANT:
-        - Extract ALL key-value pairs you find (dates, names, IDs, amounts, statuses, etc.)
-        - For tables: capture headers and all rows
-        - Return exact values as they appear
-        - Use consistent key naming (lowercase, underscores)
-        - Skip empty or meaningless data
+2. TABLES:
+   - Extract ALL tables found in the content
+   - Convert EACH ROW of a table into a key-value object
+   - Keys MUST come from the table headers
+   - Values MUST come from the corresponding row cells
+   - If a cell is empty, use null
+   - Do NOT return tables as arrays of positional values
 
-        Return JSON in this EXACT format:
+IMPORTANT RULES:
+- Extract ALL key-value pairs you find
+- Do NOT drop rows or columns
+- Skip meaningless or empty tables
+- Use descriptive table names when possible, otherwise null
+- Keep output strictly valid JSON
+
+Return JSON in this EXACT format:
+{
+  "key_value_pairs": {
+    "key_name": "value",
+    "another_key": "another_value"
+  },
+  "tables": [
+    {
+      "table_name": "descriptive name or null",
+      "rows": [
         {
-        "key_value_pairs": {
-            "key_name": "value",
-            "another_key": "another_value"
+          "column1": "data1",
+          "column2": "data2",
+          "column3": "data3"
         },
-        "tables": [
-            {
-            "table_name": "descriptive name or null",
-            "headers": ["col1", "col2", "col3"],
-            "rows": [
-                ["val1", "val2", "val3"],
-                ["val4", "val5", "val6"]
-            ]
-            }
-        ]
-        }"""
+        {
+          "column1": "data4",
+          "column2": "data5",
+          "column3": "data6"
+        }
+      ]
+    }
+  ]
+}
+"""
+    user_prompt = f"""
+You are given a MARKDOWN CHUNK extracted from a document.
 
-            user_prompt = f"""Extract all key-value pairs and tables from this content:
+TASK:
+- Identify and extract ALL tables present in this content.
+- A table may appear as:
+  - Markdown pipe tables (| col | col |)
+  - Plain text tables with aligned columns
+  - Header followed by repeated row patterns
+  - Continuation tables that start without headers
+- Treat tables as DISTINCT even if they share the same headers.
+- Do NOT merge tables unless they are clearly one continuous table.
 
-        {content}
+FOR TABLE EXTRACTION:
+- Extract EVERY ROW from EVERY TABLE
+- Do NOT skip small tables
+- Do NOT skip tables with only one row
+- Do NOT skip tables without borders
+- If a table continues after text, include all rows
+- If headers repeat, keep them only once per table
+- If a row is partially missing, use null for missing values
 
-        Return the extraction in JSON format."""
+FOR KEY-VALUE EXTRACTION:
+- Extract ALL explicit and implicit key-value pairs
+- Include dates, IDs, monetary values, statuses, references, parties, and addresses
 
-            try:
-                client = AzureOpenAI(
-                    azure_endpoint=OPENAI_ENDPOINT,
-                    api_key=OPENAI_API_KEY,
-                    api_version="2025-01-01-preview"
-                )
+IMPORTANT:
+- You MUST return ALL tables found in the chunk
+- Missing a table is considered an incorrect response
+- Never summarize or infer table data
 
-                response = client.chat.completions.create(
-                    model=OPENAI_DEPLOYMENT,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"}
-                )
+CONTENT TO ANALYZE:
+-------------------
+{content}
+-------------------
 
-                result_text = response.choices[0].message.content
-                result_json = json.loads(result_text)
+Return ONLY valid JSON matching the required schema.
+"""
+#     user_prompt = f"""Extract all key-value pairs and tables from this markdown content.
 
-                # Log token usage
-                usage = response.usage
-                log_event("openai", "extract_kv_tables",
-                        f"Extracted data from chunk ({usage.prompt_tokens} input tokens)",
-                        status="success",
-                        input_tokens=usage.prompt_tokens,
-                        output_tokens=usage.completion_tokens,
-                        api_call="chat.completions.create")
+# For tables: Convert each table into the specified JSON format where each row is an object with column headers as keys.
 
-                return result_json
+# Content:
+# {content}
 
-            except Exception as e:
-                log_event("openai", "extract_kv_tables", "Extraction failed for chunk",
-                        status="error", error_details=str(e), api_call="chat.completions.create")
-                return {"key_value_pairs": {}, "tables": []}
+# Return ONLY valid JSON following the exact format specified in the system prompt."""
+    
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=OPENAI_ENDPOINT,
+            api_key=OPENAI_API_KEY,
+            api_version="2025-01-01-preview"
+        )
+        
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        
+        result_text = response.choices[0].message.content
+        result_json = json.loads(result_text)
+        
+        # Log token usage
+        usage = response.usage
+        log_event("openai", "extract_kv_tables",
+                f"Extracted data from chunk ({usage.prompt_tokens} input tokens)",
+                status="success",
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                api_call="chat.completions.create")
+        
+        return result_json
+        
+    except Exception as e:
+        log_event("openai", "extract_kv_tables", "Extraction failed for chunk",
+                status="error", error_details=str(e), api_call="chat.completions.create")
+        return {"key_value_pairs": {}, "tables": {}}
+    
 
 # ============= NEW HTTP TRIGGER FUNCTION =============
 
